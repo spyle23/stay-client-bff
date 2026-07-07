@@ -1,0 +1,6 @@
+node_modules
+dist
+coverage
+# Types générés depuis l'OpenAPI PMS + snapshot (jamais formatés/édités à la main)
+src/types/generated
+openapi

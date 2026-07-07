@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['eslint.config.mjs'],
+    // Types générés depuis l'OpenAPI PMS + config de génération (hors périmètre lint).
+    ignores: ['eslint.config.mjs', 'openapi-ts.config.ts', 'src/types/generated/**'],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
