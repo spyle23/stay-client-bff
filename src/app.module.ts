@@ -1,8 +1,11 @@
 import { Module } from '@nestjs/common';
+import { APP_FILTER, APP_PIPE } from '@nestjs/core';
 import { LoggerModule } from 'nestjs-pino';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { CorrelationModule } from './common/correlation/correlation.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { buildValidationPipe } from './common/pipes/validation.pipe';
 import { pinoHttpOptions } from './common/logging/logger.config';
 import { RedisModule } from './redis/redis.module';
 import { PmsModule } from './integration/pms/pms.module';
@@ -16,8 +19,9 @@ import { ConsentModule } from './modules/consent/consent.module';
 import { HealthModule } from './modules/health/health.module';
 
 // Socle transverse (story 1.3) : logs pino + redaction, corrélation-id, Redis (magasin d'état),
-// health check. PmsModule (1.2) = frontière PMS. Les modules de domaine restent des coquilles
-// (logique métier ajoutée dans les stories 1.6+).
+// health check. PmsModule (1.2) = frontière PMS. SearchModule (1.6) = 1ʳᵉ route métier ; la
+// story pose aussi la frontière HTTP globale (ValidationPipe + filtre d'exceptions), enregistrée
+// via APP_PIPE/APP_FILTER pour s'appliquer partout, y compris dans les tests e2e.
 @Module({
   imports: [
     LoggerModule.forRoot({ pinoHttp: pinoHttpOptions }),
@@ -34,6 +38,10 @@ import { HealthModule } from './modules/health/health.module';
     HealthModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    { provide: APP_PIPE, useValue: buildValidationPipe() },
+    { provide: APP_FILTER, useClass: AllExceptionsFilter },
+  ],
 })
 export class AppModule {}
