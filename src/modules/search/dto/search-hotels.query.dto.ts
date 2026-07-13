@@ -14,6 +14,7 @@ import {
   IsDateOnly,
   IsNotPastDate,
 } from './date-validators';
+import { SearchFiltersQueryDto } from './search-filters.query';
 
 export const WORKING_CURRENCIES = ['EUR', 'USD'] as const;
 export type WorkingCurrency = (typeof WORKING_CURRENCIES)[number];
@@ -24,8 +25,11 @@ export type WorkingCurrency = (typeof WORKING_CURRENCIES)[number];
  *
  * La validation métier (départ > arrivée, arrivée non passée UTC, voyageurs ≥ 1) est portée
  * par les décorateurs → **rejet 400 sans aucun appel PMS** (AC-2).
+ *
+ * Hérite du bloc **filtre/tri** (`sort`, `minPrice`, `maxPrice`, `minCapacity`, `category`,
+ * `amenities`) partagé avec la proximité — FR-3, story 1.8.
  */
-export class SearchHotelsQueryDto {
+export class SearchHotelsQueryDto extends SearchFiltersQueryDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

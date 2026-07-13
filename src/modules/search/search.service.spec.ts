@@ -548,4 +548,219 @@ describe('SearchService', () => {
       expect(roomPath).toContain('CheckOutDate=2026-08-03T00:00:00Z');
     });
   });
+
+  describe('filtres & tri (FR-3 — story 1.8)', () => {
+    /** Mock générique : candidats destination + dispo paramétrable par hôtel. */
+    function mockSearch(
+      hotels: Partial<PmsHotel>[],
+      roomsByHotel: Record<string, Partial<PmsRoom>[]>,
+    ) {
+      getList.mockImplementation((path: string) => {
+        if (path.startsWith('/Hotels/search')) {
+          return Promise.resolve(hotelList(hotels));
+        }
+        const match = /\/Rooms\/hotel\/([^/]+)\/available/.exec(path);
+        const id = match ? match[1] : '';
+        return Promise.resolve(roomList(roomsByHotel[id] ?? []));
+      });
+    }
+
+    it('filtre par fourchette de prix (sur le total du séjour, en cents)', async () => {
+      // 2 nuits : prix/nuit 100 → total 20000 c ; 50 → 10000 c.
+      mockSearch(
+        [
+          { id: 'cher', currency: 'EUR' },
+          { id: 'pas-cher', currency: 'EUR' },
+        ],
+        { cher: [{ price: 100 }], 'pas-cher': [{ price: 50 }] },
+      );
+
+      const result = await service.searchHotels({
+        ...baseQuery,
+        minPrice: 15000,
+      });
+
+      expect(result.items.map((h) => h.hotelId)).toEqual(['cher']);
+      expect(result.totalCount).toBe(1);
+    });
+
+    it('ignore une fourchette de prix incohérente (min > max) — aucun filtrage', async () => {
+      mockSearch(
+        [
+          { id: 'a', currency: 'EUR' },
+          { id: 'b', currency: 'EUR' },
+        ],
+        { a: [{ price: 100 }], b: [{ price: 50 }] },
+      );
+
+      const result = await service.searchHotels({
+        ...baseQuery,
+        minPrice: 20000,
+        maxPrice: 5000,
+      });
+
+      expect(result.totalCount).toBe(2);
+    });
+
+    it("filtre par catégorie d'hôtel (insensible casse/accents, multi-valeurs)", async () => {
+      mockSearch(
+        [
+          { id: 'quatre', currency: 'EUR', category: '4-star' },
+          { id: 'boutique', currency: 'EUR', category: 'Boutique' },
+          { id: 'autre', currency: 'EUR', category: 'Hostel' },
+        ],
+        {
+          quatre: [{ price: 100 }],
+          boutique: [{ price: 100 }],
+          autre: [{ price: 100 }],
+        },
+      );
+
+      const result = await service.searchHotels({
+        ...baseQuery,
+        category: ['4-STAR', 'boutiqué'],
+      });
+
+      expect(result.items.map((h) => h.hotelId).sort()).toEqual([
+        'boutique',
+        'quatre',
+      ]);
+    });
+
+    it('capacité : resserre MinCapacity du fan-out (max(guests, minCapacity))', async () => {
+      mockSearch([{ id: 'h1', currency: 'EUR' }], {
+        h1: [{ price: 100, capacity: 6 }],
+      });
+
+      await service.searchHotels({ ...baseQuery, guests: 2, minCapacity: 4 });
+
+      const roomPath = decodeURIComponent(roomCallPaths(getList)[0]);
+      expect(roomPath).toContain('MinCapacity=4');
+    });
+
+    it('équipements : garde les hôtels dont une chambre porte TOUS les tokens ; recalcule le prix min', async () => {
+      mockSearch(
+        [
+          { id: 'wifi', currency: 'EUR' },
+          { id: 'sans', currency: 'EUR' },
+        ],
+        {
+          // wifi : chambre chère AVEC wifi (200) + chambre pas chère SANS wifi (50).
+          wifi: [
+            { price: 200, amenities: 'WiFi, Parking' },
+            { price: 50, amenities: 'Parking' },
+          ],
+          sans: [{ price: 50, amenities: 'Parking' }],
+        },
+      );
+
+      const result = await service.searchHotels({
+        ...baseQuery,
+        amenities: ['wifi'],
+      });
+
+      expect(result.items.map((h) => h.hotelId)).toEqual(['wifi']);
+      // Prix min recalculé PARMI les chambres wifi (200), pas la chambre à 50 sans wifi.
+      expect(result.items[0].fromPricePerNight).toBe(20000);
+      expect(result.items[0].availableRoomCount).toBe(1);
+    });
+
+    it("expose l'union des équipements (facette) indépendamment du filtre", async () => {
+      mockSearch([{ id: 'h1', currency: 'EUR' }], {
+        h1: [
+          { price: 100, amenities: 'WiFi, Parking' },
+          { price: 120, amenities: 'Piscine ; wifi' },
+        ],
+      });
+
+      const result = await service.searchHotels(baseQuery);
+
+      // Dé-dupliqué par forme normalisée (wifi une seule fois), formes d'affichage conservées.
+      expect(result.items[0].amenities).toEqual(['WiFi', 'Parking', 'Piscine']);
+    });
+
+    it('trie par prix croissant puis décroissant (sur le total du séjour)', async () => {
+      const hotels = [
+        { id: 'c', currency: 'EUR' },
+        { id: 'a', currency: 'EUR' },
+        { id: 'b', currency: 'EUR' },
+      ];
+      const rooms = {
+        a: [{ price: 50 }],
+        b: [{ price: 100 }],
+        c: [{ price: 150 }],
+      };
+      mockSearch(hotels, rooms);
+      const asc = await service.searchHotels({
+        ...baseQuery,
+        sort: 'price_asc',
+      });
+      expect(asc.items.map((h) => h.hotelId)).toEqual(['a', 'b', 'c']);
+
+      mockSearch(hotels, rooms);
+      const desc = await service.searchHotels({
+        ...baseQuery,
+        sort: 'price_desc',
+      });
+      expect(desc.items.map((h) => h.hotelId)).toEqual(['c', 'b', 'a']);
+    });
+
+    it('sort=distance est un no-op en mode destination (ordre inchangé)', async () => {
+      mockSearch(
+        [
+          { id: 'x', currency: 'EUR' },
+          { id: 'y', currency: 'EUR' },
+        ],
+        { x: [{ price: 100 }], y: [{ price: 100 }] },
+      );
+
+      const result = await service.searchHotels({
+        ...baseQuery,
+        sort: 'distance',
+      });
+
+      // Aucun distanceKm en destination → ordre d'insertion préservé.
+      expect(result.items.map((h) => h.hotelId)).toEqual(['x', 'y']);
+      expect(result.items.every((h) => h.distanceKm === null)).toBe(true);
+    });
+
+    it('applique aussi les filtres/tri en mode proximité (prix, tri prix prime sur distance)', async () => {
+      getList.mockImplementation((path: string) => {
+        if (path.startsWith('/Hotels/nearby')) {
+          return Promise.resolve(
+            nearbyList([
+              { id: 'proche-cher', currency: 'EUR', distanceKm: 0.5 },
+              { id: 'loin-pas-cher', currency: 'EUR', distanceKm: 9 },
+            ]),
+          );
+        }
+        const match = /\/Rooms\/hotel\/([^/]+)\/available/.exec(path);
+        const id = match ? match[1] : '';
+        const price = id === 'proche-cher' ? 200 : 50;
+        return Promise.resolve(roomList([{ price }]));
+      });
+
+      const result = await service.searchNearby({
+        ...baseNearby,
+        sort: 'price_asc',
+      });
+
+      // Tri prix ↑ prime sur le défaut distance : le moins cher (loin) passe devant.
+      expect(result.items.map((h) => h.hotelId)).toEqual([
+        'loin-pas-cher',
+        'proche-cher',
+      ]);
+    });
+
+    it('clé de cache distincte selon les filtres (une vue filtrée ne sert pas la vue non filtrée)', async () => {
+      mockSearch([{ id: 'h1', currency: 'EUR' }], { h1: [{ price: 100 }] });
+      await service.searchHotels(baseQuery);
+      await service.searchHotels({ ...baseQuery, minPrice: 5000 });
+
+      const keys = (set.mock.calls as unknown[][]).map((c) =>
+        typeof c[0] === 'string' ? c[0] : '',
+      );
+      expect(new Set(keys).size).toBe(2); // deux clés différentes
+    });
+  });
 });

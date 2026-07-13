@@ -13,6 +13,11 @@ import { RedisService } from '../../redis/redis.service';
 import type { components } from '../../types/generated/pms';
 import { SEARCH_OPTIONS, type SearchOptions } from './search.constants';
 import { parseDateOnlyUtc } from './dto/date-validators';
+import {
+  normalizeToken,
+  tokenizeAmenities,
+  type SortOption,
+} from './dto/search-filters.query';
 import type { HotelAvailabilityDto } from './dto/hotel-availability.dto';
 import type { SearchHotelsQueryDto } from './dto/search-hotels.query.dto';
 import type { SearchNearbyQueryDto } from './dto/search-nearby.query.dto';
@@ -21,6 +26,9 @@ type PmsHotel = components['schemas']['HotelDto'];
 type PmsHotelWithDistance = components['schemas']['HotelWithDistanceDto'];
 type PmsRoom = components['schemas']['RoomDto'];
 
+/** Mode de recherche — pilote le tri par défaut (proximité → distance ; destination → pertinence). */
+type SearchMode = 'destination' | 'nearby';
+
 export interface SearchHotelsResult {
   items: HotelAvailabilityDto[];
   page: number;
@@ -28,10 +36,21 @@ export interface SearchHotelsResult {
   totalCount: number;
 }
 
-/** Critères datés partagés par les deux modes (destination et proximité). */
+/** Critères datés + filtres/tri partagés par les deux modes (destination et proximité). */
 type FanoutQuery = Pick<
   SearchHotelsQueryDto,
-  'checkInDate' | 'checkOutDate' | 'guests' | 'currency' | 'page' | 'pageSize'
+  | 'checkInDate'
+  | 'checkOutDate'
+  | 'guests'
+  | 'currency'
+  | 'page'
+  | 'pageSize'
+  | 'sort'
+  | 'minPrice'
+  | 'maxPrice'
+  | 'minCapacity'
+  | 'category'
+  | 'amenities'
 >;
 
 /** Hôtel candidat au fan-out + sa distance éventuelle (mode proximité uniquement). */
@@ -92,7 +111,13 @@ export class SearchService {
     );
     const candidates = this.toCandidates(candidatesRes.data, query.currency);
 
-    const result = await this.runFanout(candidates, query, nights, ctx, false);
+    const result = await this.runFanout(
+      candidates,
+      query,
+      nights,
+      ctx,
+      'destination',
+    );
     await this.writeCache(cacheKey, result);
     return result;
   }
@@ -123,9 +148,16 @@ export class SearchService {
     );
     const candidates = this.toCandidates(candidatesRes.data, query.currency);
 
-    // Tri distance croissant appliqué APRÈS le fan-out (défensif : prépare la bascule D1 dont
-    // l'ordre n'est pas garanti, et re-trie après exclusion des indisponibles).
-    const result = await this.runFanout(candidates, query, nights, ctx, true);
+    // Tri distance croissant par défaut, appliqué APRÈS le fan-out (défensif : prépare la bascule
+    // D1 dont l'ordre n'est pas garanti, et re-trie après exclusion des indisponibles). Un `sort`
+    // explicite (prix ↑/↓) dans l'URL prime sur ce défaut.
+    const result = await this.runFanout(
+      candidates,
+      query,
+      nights,
+      ctx,
+      'nearby',
+    );
     await this.writeCache(cacheKey, result);
     return result;
   }
@@ -161,7 +193,7 @@ export class SearchService {
     query: FanoutQuery,
     nights: number,
     ctx: PmsRequestContext | undefined,
-    sortByDistance: boolean,
+    mode: SearchMode,
   ): Promise<SearchHotelsResult> {
     const outcomes = await mapWithConcurrency(
       candidates,
@@ -169,30 +201,29 @@ export class SearchService {
       (candidate) => this.availabilityFor(candidate, query, nights, ctx),
     );
 
-    const available = outcomes
+    const availableAll = outcomes
       .filter((o): o is AvailableOutcome => o.kind === 'available')
       .map((o) => o.dto);
 
-    // Dégradation : des candidats existent, AUCUN résultat disponible, ET au moins un appel de
-    // dispo a échoué (panne/timeout/5xx = `failed`) → 503. On ne présente JAMAIS une panne comme
-    // « 0 résultat » (NFR-10/AC-4). Un candidat légitimement vide (`empty`) ou un 4xx métier
-    // (mappé en `empty`), ou 0 candidat (rayon vide), ne déclenche pas la dégradation.
+    // Dégradation : des candidats existent, AUCUN résultat disponible (AVANT filtrage), ET au
+    // moins un appel de dispo a échoué (panne/timeout/5xx = `failed`) → 503. On ne présente JAMAIS
+    // une panne comme « 0 résultat » (NFR-10/AC-4). La garde s'évalue sur l'ensemble PRÉ-filtre :
+    // une liste vidée par les filtres est un état vide (AC-6), pas une panne.
     const failed = outcomes.filter((o) => o.kind === 'failed').length;
-    if (candidates.length > 0 && available.length === 0 && failed > 0) {
+    if (candidates.length > 0 && availableAll.length === 0 && failed > 0) {
       throw new PmsUnavailableError(
         'Le PMS est indisponible : recherche impossible pour le moment.',
       );
     }
 
-    if (sortByDistance) {
-      available.sort((a, b) => {
-        const da = a.distanceKm ?? Number.POSITIVE_INFINITY;
-        const db = b.distanceKm ?? Number.POSITIVE_INFINITY;
-        // `da === db ? 0` évite `Infinity - Infinity = NaN` (deux distances nulles) : un
-        // comparateur renvoyant NaN laisse le tri dans un ordre indéterminé.
-        return da === db ? 0 : da - db;
-      });
-    }
+    // Filtres hôtel-level (prix + catégorie) — FR-3, appliqués sur l'ensemble agrégé AVANT
+    // pagination (AC-8), donc `totalCount` reflète le total filtré (pas la page).
+    const available = this.applyHotelFilters(availableAll, query);
+
+    // Tri : option demandée, sinon défaut du mode (proximité → distance ; destination → ordre PMS).
+    const sort: SortOption | undefined =
+      query.sort ?? (mode === 'nearby' ? 'distance' : undefined);
+    sortResults(available, sort);
 
     const totalCount = available.length;
     const start = (query.page - 1) * query.pageSize;
@@ -203,6 +234,44 @@ export class SearchService {
       pageSize: query.pageSize,
       totalCount,
     };
+  }
+
+  /**
+   * Filtres **hôtel-level** (FR-3) : fourchette de prix (sur `fromTotalPrice`, cents, devise unique)
+   * + catégorie d'hôtel (match exact normalisé, OU logique inter-valeurs). La capacité et les
+   * équipements sont appliqués **room-level** dans `availabilityFor`.
+   */
+  private applyHotelFilters(
+    hotels: HotelAvailabilityDto[],
+    query: FanoutQuery,
+  ): HotelAvailabilityDto[] {
+    const { minPrice, maxPrice } = normalizePriceRange(
+      query.minPrice,
+      query.maxPrice,
+    );
+    const categories = (query.category ?? []).map(normalizeToken);
+    if (
+      minPrice === undefined &&
+      maxPrice === undefined &&
+      categories.length === 0
+    ) {
+      return hotels;
+    }
+    return hotels.filter((hotel) => {
+      if (minPrice !== undefined && hotel.fromTotalPrice < minPrice) {
+        return false;
+      }
+      if (maxPrice !== undefined && hotel.fromTotalPrice > maxPrice) {
+        return false;
+      }
+      if (categories.length > 0) {
+        const category = hotel.category ? normalizeToken(hotel.category) : '';
+        if (!categories.includes(category)) {
+          return false;
+        }
+      }
+      return true;
+    });
   }
 
   private async availabilityFor(
@@ -220,19 +289,38 @@ export class SearchService {
         `/Rooms/hotel/${hotel.id}/available?${this.roomQuery(query)}`,
         ctx,
       );
+      // Chambres candidates : le PMS a déjà filtré par capacité (`MinCapacity`, cf. roomQuery).
+      // La facette d'équipements (`amenityUnion`) est calculée AVANT le filtre équipements pour
+      // ne pas rétrécir les options côté front (FR-3/AC-5, Décision 3).
       const rooms = roomsRes.data ?? [];
-      const count = roomsRes.pagination?.totalCount ?? rooms.length;
-      // Prix strictement positif : un prix 0/négatif (erreur de saisie PMS) ne doit jamais
-      // devenir un « à partir de 0 € »/négatif.
-      const prices = rooms
+      const amenityUnion = collectAmenities(rooms);
+
+      // Filtre équipements (repli D9) : ne garder que les chambres portant TOUS les tokens demandés.
+      const requestedAmenities = (query.amenities ?? []).map(normalizeToken);
+      const matchingRooms =
+        requestedAmenities.length > 0
+          ? rooms.filter((room) =>
+              roomHasAllAmenities(room, requestedAmenities),
+            )
+          : rooms;
+
+      // Prix strictement positif parmi les chambres éligibles : un prix 0/négatif (erreur de
+      // saisie PMS) ne doit jamais devenir un « à partir de 0 € »/négatif.
+      const prices = matchingRooms
         .map((room) => room.price)
         .filter(
           (p): p is number =>
             typeof p === 'number' && Number.isFinite(p) && p > 0,
         );
-      if (count <= 0 || prices.length === 0) {
+      if (prices.length === 0) {
         return { kind: 'empty' };
       }
+      // Nb de chambres : total PMS quand aucun post-filtre équipement ; sinon le compte des
+      // chambres réellement retenues (sur la page fan-out).
+      const count =
+        requestedAmenities.length > 0
+          ? matchingRooms.length
+          : (roomsRes.pagination?.totalCount ?? rooms.length);
       const minPerNight = Math.min(...prices);
       return {
         kind: 'available',
@@ -243,6 +331,7 @@ export class SearchService {
           count,
           query.currency,
           candidate.distanceKm,
+          amenityUnion,
         ),
       };
     } catch (err) {
@@ -307,7 +396,13 @@ export class SearchService {
     // arrive en `Kind=Unspecified`, rejetée par Npgsql sur les colonnes `timestamptz` (→ 500).
     params.set('CheckInDate', toPmsUtcDateTime(query.checkInDate));
     params.set('CheckOutDate', toPmsUtcDateTime(query.checkOutDate));
-    params.set('MinCapacity', String(query.guests));
+    // Capacité : le filtre `minCapacity` (FR-3) RESSERRE la disponibilité côté PMS (`MinCapacity`).
+    // Un hôtel sans chambre assez grande disparaît, et `fromPrice`/`availableRoomCount` se
+    // recalculent naturellement sur les chambres restantes (Décision 2).
+    params.set(
+      'MinCapacity',
+      String(Math.max(query.guests, query.minCapacity ?? 0)),
+    );
     params.set('PageSize', '100');
     return params.toString();
   }
@@ -321,6 +416,7 @@ export class SearchService {
       currency: query.currency,
       page: query.page,
       pageSize: query.pageSize,
+      ...filterCacheParts(query),
     });
     return CACHE_PREFIX + createHash('sha1').update(normalized).digest('hex');
   }
@@ -343,6 +439,7 @@ export class SearchService {
       currency: query.currency,
       page: query.page,
       pageSize: query.pageSize,
+      ...filterCacheParts(query),
     });
     return (
       NEARBY_CACHE_PREFIX + createHash('sha1').update(normalized).digest('hex')
@@ -393,6 +490,7 @@ function toAvailabilityDto(
   availableRoomCount: number,
   fallbackCurrency: string,
   distanceKm: number | null,
+  amenities: string[],
 ): HotelAvailabilityDto {
   return {
     hotelId: hotel.id ?? '',
@@ -409,6 +507,83 @@ function toAvailabilityDto(
     latitude: hotel.latitude ?? null,
     longitude: hotel.longitude ?? null,
     distanceKm,
+    amenities,
+  };
+}
+
+/** Bornes de prix cohérentes : `min > max` (incohérent) → les deux bornes sont ignorées (AC-7). */
+function normalizePriceRange(
+  minPrice: number | undefined,
+  maxPrice: number | undefined,
+): { minPrice: number | undefined; maxPrice: number | undefined } {
+  if (minPrice !== undefined && maxPrice !== undefined && minPrice > maxPrice) {
+    return { minPrice: undefined, maxPrice: undefined };
+  }
+  return { minPrice, maxPrice };
+}
+
+/** Trie en place la liste (prix sur `fromTotalPrice`, distance sur `distanceKm`). */
+function sortResults(
+  hotels: HotelAvailabilityDto[],
+  sort: SortOption | undefined,
+): void {
+  if (sort === 'price_asc') {
+    hotels.sort((a, b) => a.fromTotalPrice - b.fromTotalPrice);
+  } else if (sort === 'price_desc') {
+    hotels.sort((a, b) => b.fromTotalPrice - a.fromTotalPrice);
+  } else if (sort === 'distance') {
+    hotels.sort((a, b) => {
+      const da = a.distanceKm ?? Number.POSITIVE_INFINITY;
+      const db = b.distanceKm ?? Number.POSITIVE_INFINITY;
+      // `da === db ? 0` évite `Infinity - Infinity = NaN` (deux distances nulles).
+      return da === db ? 0 : da - db;
+    });
+  }
+  // `sort` indéfini → ordre inchangé (pertinence PMS, comportement destination 1.6).
+}
+
+/** Union des équipements (formes d'affichage) des chambres, dé-dupliquée par forme normalisée. */
+function collectAmenities(rooms: PmsRoom[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const room of rooms) {
+    if (!room.amenities) {
+      continue;
+    }
+    for (const part of room.amenities.split(/[,;/]/)) {
+      const trimmed = part.trim();
+      if (trimmed.length === 0) {
+        continue;
+      }
+      const key = normalizeToken(trimmed);
+      if (key.length === 0 || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+/** Vrai si la chambre porte TOUS les tokens d'équipement demandés (déjà normalisés) — ET logique. */
+function roomHasAllAmenities(room: PmsRoom, requested: string[]): boolean {
+  if (requested.length === 0) {
+    return true;
+  }
+  const tokens = new Set(tokenizeAmenities(room.amenities));
+  return requested.every((token) => tokens.has(token));
+}
+
+/** Portions de clé de cache dérivées des filtres/tri (ordre stable → hash stable). */
+function filterCacheParts(query: FanoutQuery) {
+  return {
+    sort: query.sort ?? null,
+    minPrice: query.minPrice ?? null,
+    maxPrice: query.maxPrice ?? null,
+    minCapacity: query.minCapacity ?? null,
+    category: (query.category ?? []).map(normalizeToken).sort(),
+    amenities: (query.amenities ?? []).map(normalizeToken).sort(),
   };
 }
 

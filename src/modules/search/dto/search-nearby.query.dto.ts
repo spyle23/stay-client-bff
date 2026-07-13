@@ -17,6 +17,7 @@ import {
   WORKING_CURRENCIES,
   type WorkingCurrency,
 } from './search-hotels.query.dto';
+import { SearchFiltersQueryDto } from './search-filters.query';
 
 /**
  * Query de recherche « à proximité » (FR-2). Route dédiée `GET /api/v1/search/hotels/nearby` :
@@ -26,8 +27,11 @@ import {
  *
  * Coordonnées/dates invalides → **rejet 400 sans aucun appel PMS** (AC-6). Le `radiusKm` est
  * borné côté service au rayon maximal configuré (`nearbyMaxRadiusKm`).
+ *
+ * Hérite du bloc **filtre/tri** (`sort`, `minPrice`, `maxPrice`, `minCapacity`, `category`,
+ * `amenities`) partagé avec la recherche par destination — FR-3, story 1.8.
  */
-export class SearchNearbyQueryDto {
+export class SearchNearbyQueryDto extends SearchFiltersQueryDto {
   @Type(() => Number)
   @IsNumber()
   @Min(-90)

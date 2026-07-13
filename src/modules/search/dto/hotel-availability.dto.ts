@@ -31,4 +31,11 @@ export interface HotelAvailabilityDto {
    * destination. Non monétaire → pas de conversion en cents.
    */
   distanceKm: number | null;
+  /**
+   * Équipements disponibles (union des `RoomDto.amenities` des chambres réellement disponibles
+   * de l'hôtel, post-capacité) — story 1.8, repli **D9** (services d'hôtel non publics). Sert de
+   * **source de facettes** au front (options du filtre « équipements ») et est peuplé
+   * **indépendamment** du filtre `amenities` actif pour ne pas rétrécir les options. `[]` si aucun.
+   */
+  amenities: string[];
 }
