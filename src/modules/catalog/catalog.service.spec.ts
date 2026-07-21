@@ -513,4 +513,278 @@ describe('CatalogService', () => {
       expect(ttl).toBe(60);
     }
   });
+
+  // --- Story 1.10 : fiche chambre (getRoomDetail) -----------------------------------------
+  describe('getRoomDetail', () => {
+    const ROOM_ID = '22222222-2222-2222-2222-222222222222';
+
+    /**
+     * Dispatche `getList` par chemin : liste NON datée (trouve la chambre) vs set `/available`
+     * (cross-check de disponibilité). Un mock indifférencié masquerait le comportement réel.
+     */
+    function dispatchRooms(opts: {
+      list?: Partial<PmsRoom>[];
+      available?: Partial<PmsRoom>[];
+      listError?: Error;
+      availableError?: Error;
+    }): void {
+      pmsGetList.mockImplementation((path: string) => {
+        if (path.includes('/available')) {
+          return opts.availableError
+            ? Promise.reject(opts.availableError)
+            : Promise.resolve(roomList(opts.available ?? []));
+        }
+        return opts.listError
+          ? Promise.reject(opts.listError)
+          : Promise.resolve(roomList(opts.list ?? []));
+      });
+    }
+
+    /** Fiche complète (dates) : mapping des champs + total dérivé + disponibilité par cross-check. */
+    it('mappe la fiche (photos, catégorie, services inclus, total) et marque disponible', async () => {
+      hotelFixture = {
+        id: HOTEL_ID,
+        name: 'Hôtel Test',
+        city: 'Antananarivo',
+        currency: 'EUR',
+      };
+      imageFixtures[ROOM_ID] = [
+        { url: 'https://img/2.png', displayOrder: 2 },
+        { url: 'https://img/primary.png', isPrimary: true, displayOrder: 5 },
+      ];
+      dispatchRooms({
+        list: [
+          {
+            id: ROOM_ID,
+            number: '101',
+            category: 'Suite',
+            capacity: 2,
+            price: 120,
+            amenities: 'Wifi, Clim',
+            floor: 1,
+            description: 'Vue mer',
+            status: AVAILABLE,
+            includedServices: [
+              {
+                serviceName: 'Petit-déjeuner',
+                includedQuantity: 2,
+                isActive: true,
+              },
+            ],
+          },
+        ],
+        available: [{ id: ROOM_ID, price: 120, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(dto.id).toBe(ROOM_ID);
+      expect(dto.hotelName).toBe('Hôtel Test');
+      expect(dto.hotelCity).toBe('Antananarivo');
+      expect(dto.category).toBe('Suite');
+      expect(dto.capacity).toBe(2);
+      expect(dto.description).toBe('Vue mer');
+      expect(dto.pricePerNight).toBe(12000);
+      expect(dto.totalPrice).toBe(24000); // 12000 × 2 nuits
+      expect(dto.nights).toBe(2);
+      expect(dto.currency).toBe('EUR');
+      expect(dto.available).toBe(true);
+      expect(dto.availabilityDegraded).toBe(false);
+      // Images triées : primaire d'abord malgré un displayOrder plus élevé.
+      expect(dto.images.map((i) => i.url)).toEqual([
+        'https://img/primary.png',
+        'https://img/2.png',
+      ]);
+      expect(dto.includedServices).toEqual([
+        { name: 'Petit-déjeuner', quantity: 2, notes: null },
+      ]);
+    });
+
+    /** Chambre présente mais ABSENTE du set daté → indisponible pour ces dates (non dégradé). */
+    it('marque indisponible une chambre absente du set daté (données rendues, non dégradé)', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 120, capacity: 2, status: AVAILABLE }],
+        available: [], // aucune dispo pour ces dates
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(dto.id).toBe(ROOM_ID);
+      expect(dto.available).toBe(false);
+      expect(dto.availabilityDegraded).toBe(false);
+      expect(dto.pricePerNight).toBe(12000); // la fiche reste affichable
+    });
+
+    /** Garde-prix : une chambre au prix ≤ 0 (saisie PMS aberrante) n'est jamais réservable, même
+     * présente dans le set daté (le PMS `/available` ne garantit pas ce filtre). */
+    it('ne rend jamais réservable une chambre au prix ≤ 0, même dans le set daté', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: -5, capacity: 2, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: -5, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(dto.available).toBe(false);
+    });
+
+    /** Sans dates : éligibilité statique (Available + prix), et AUCUN appel `/available`. */
+    it('sans dates : disponibilité par éligibilité statique, sans appel /available', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 90, capacity: 2, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, {});
+
+      expect(dto.available).toBe(true);
+      expect(dto.nights).toBeNull();
+      expect(dto.totalPrice).toBeNull();
+      const paths = (pmsGetList.mock.calls as unknown[][]).map(
+        (args) => args[0] as string,
+      );
+      expect(paths.some((p) => p.includes('/available'))).toBe(false);
+    });
+
+    /** Sans dates : une chambre en maintenance est rendue mais NON disponible. */
+    it('sans dates : une chambre non Available est rendue mais indisponible', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 90, capacity: 2, status: MAINTENANCE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, {});
+
+      expect(dto.available).toBe(false);
+    });
+
+    /** Chambre absente de l'hôtel → 404 (fiche introuvable). */
+    it('propage un 404 quand la chambre est absente de l’hôtel', async () => {
+      dispatchRooms({ list: [{ id: 'autre', price: 90, status: AVAILABLE }] });
+
+      await expect(
+        service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery),
+      ).rejects.toThrow(PmsRequestError);
+    });
+
+    /** Hôtel introuvable → 404 sans jamais chercher la chambre. */
+    it('propage un 404 hôtel sans lister les chambres', async () => {
+      pmsGet.mockRejectedValue(new PmsRequestError('Hotel not found', 404));
+
+      await expect(
+        service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery),
+      ).rejects.toThrow(PmsRequestError);
+      expect(pmsGetList).not.toHaveBeenCalled();
+    });
+
+    /** Panne (non-404) sur la liste des chambres → dégradation de page (rethrow → 503). */
+    it('rethrow une panne (non-404) de la liste des chambres', async () => {
+      dispatchRooms({ listError: new PmsUnavailableError('rooms down') });
+
+      await expect(
+        service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery),
+      ).rejects.toThrow(PmsUnavailableError);
+    });
+
+    /** Panne du cross-check daté → availabilityDegraded, repli statique, réponse NON cachée. */
+    it('dégrade la disponibilité datée sans échouer, et ne cache pas', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 90, capacity: 2, status: AVAILABLE }],
+        availableError: new PmsUnavailableError('availability down'),
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(dto.availabilityDegraded).toBe(true);
+      expect(dto.available).toBe(true); // repli sur l'éligibilité statique
+      const writtenKeys = (redisSet.mock.calls as unknown[][]).map(
+        (args) => args[0] as string,
+      );
+      expect(writtenKeys.some((k) => k.startsWith('catalog:room:'))).toBe(
+        false,
+      );
+    });
+
+    /** Services inclus : seuls les actifs et nommés sont exposés. */
+    it('n’expose que les services inclus actifs et nommés', async () => {
+      dispatchRooms({
+        list: [
+          {
+            id: ROOM_ID,
+            price: 90,
+            status: AVAILABLE,
+            includedServices: [
+              { serviceName: 'Wifi', includedQuantity: 1, isActive: true },
+              { serviceName: 'Spa', isActive: false }, // inactif
+              { serviceName: '   ', isActive: true }, // sans nom
+            ],
+          },
+        ],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, {});
+
+      expect(dto.includedServices.map((s) => s.name)).toEqual(['Wifi']);
+    });
+
+    /** Exposant de devise réel (MGA = ×1) sur le prix de la fiche. */
+    it('encode le prix avec l’exposant réel de la devise', async () => {
+      hotelFixture = { id: HOTEL_ID, currency: 'MGA' };
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 12000, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, {});
+
+      expect(dto.pricePerNight).toBe(12000); // MGA : 0 décimale
+    });
+
+    /** Cross-check daté : dates ancrées UTC + MinCapacity poussés au PMS. */
+    it('ancre les dates UTC et pousse MinCapacity au cross-check de disponibilité', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 90, capacity: 4, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: 90, status: AVAILABLE }],
+      });
+
+      await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      const availablePath = (pmsGetList.mock.calls as unknown[][])
+        .map((args) => args[0] as string)
+        .find((p) => p.includes('/available'));
+      expect(availablePath).toContain(
+        `CheckInDate=${datedQuery.checkInDate}T00%3A00%3A00Z`,
+      );
+      expect(availablePath).toContain('MinCapacity=2');
+    });
+
+    /** Cache : écriture sous le préfixe room avec un TTL entier ; un hit sert sans PMS. */
+    it('écrit puis sert la fiche depuis le cache (préfixe room, TTL entier)', async () => {
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 90, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: 90, status: AVAILABLE }],
+      });
+
+      await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      const roomWrite = (redisSet.mock.calls as unknown[][]).find((args) =>
+        (args[0] as string).startsWith('catalog:room:'),
+      );
+      expect(roomWrite).toBeDefined();
+      expect(Number.isInteger(roomWrite?.[2])).toBe(true);
+      expect(roomWrite?.[2]).toBe(60);
+
+      // Hit : la valeur cachée est servie sans PMS.
+      redisGet.mockImplementation((key: string) =>
+        Promise.resolve(
+          key.startsWith('catalog:room:')
+            ? JSON.stringify({ id: ROOM_ID, available: true })
+            : null,
+        ),
+      );
+      pmsGet.mockClear();
+      pmsGetList.mockClear();
+      const cached = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+      expect(cached.id).toBe(ROOM_ID);
+      expect(pmsGet).not.toHaveBeenCalled();
+      expect(pmsGetList).not.toHaveBeenCalled();
+    });
+  });
 });

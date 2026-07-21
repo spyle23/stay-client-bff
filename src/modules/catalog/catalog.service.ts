@@ -17,14 +17,22 @@ import { CATALOG_OPTIONS, type CatalogOptions } from './catalog.constants';
 import type { HotelDetailDto, HotelGalleryImage } from './dto/hotel-detail.dto';
 import type { HotelDetailQueryDto } from './dto/hotel-detail.query.dto';
 import type { HotelRoomDto } from './dto/hotel-room.dto';
+import type {
+  RoomDetailDto,
+  RoomIncludedService,
+  RoomPhoto,
+} from './dto/room-detail.dto';
 
 type PmsHotel = components['schemas']['HotelDto'];
 type PmsRoom = components['schemas']['RoomDto'];
 type PmsRoomImage = components['schemas']['RoomImageDto'];
+type PmsRoomIncludedService = components['schemas']['RoomIncludedServiceDto'];
 
 const CACHE_PREFIX = 'catalog:hotel:v1:';
 /** La galerie est cachée **par hôtel** (indépendante des dates) → partagée par toutes les vues. */
 const GALLERY_CACHE_PREFIX = 'catalog:gallery:v1:';
+/** Cache de la fiche chambre (story 1.10) — clé par (hôtel, chambre, dates, voyageurs). */
+const ROOM_CACHE_PREFIX = 'catalog:room:v1:';
 const MS_PER_DAY = 86_400_000;
 /** Devise par défaut du PMS quand un hôtel n'en porte pas (Stay-api : `Hotel.Currency` défaut EUR). */
 const DEFAULT_CURRENCY = 'EUR';
@@ -116,6 +124,259 @@ export class CatalogService {
   }
 
   /**
+   * Détail d'une **seule** chambre (story 1.10, FR-6) pour la fiche publique. Composé depuis des
+   * endpoints **publics** du PMS : hôtel (devise + nom/ville), liste NON datée des chambres (trouve
+   * la chambre même indisponible, porte description/équipements/services inclus), set daté
+   * `/available` (cross-check de disponibilité), images.
+   *
+   * Propage une `PmsRequestError` 404 (hôtel ou chambre introuvable → 404 côté front) et une panne
+   * PMS **sur l'hôtel ou la liste des chambres** (la fiche ne peut rien afficher → 503, page
+   * dégradée). Une panne **sur la disponibilité datée** ne casse PAS la fiche (`availabilityDegraded`)
+   * et une panne **sur les images** est best-effort (galerie vide).
+   */
+  async getRoomDetail(
+    hotelId: string,
+    roomId: string,
+    query: HotelDetailQueryDto,
+  ): Promise<RoomDetailDto> {
+    const stay = this.resolveStayDates(query);
+
+    const cacheKey = this.roomCacheKey(hotelId, roomId, stay, query.guests);
+    const cached = await this.readCache<RoomDetailDto>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const ctx = this.pmsContext();
+
+    // Hôtel (public) : devise + nom/ville. 404 → chambre inatteignable → 404 ; panne → 503.
+    const hotelRes = await this.pms.get<PmsHotel>(`/Hotels/${hotelId}`, ctx);
+    const hotel = hotelRes.data;
+    if (!hotel || !hotel.id) {
+      throw new PmsRequestError('Hôtel introuvable.', 404);
+    }
+    const currency = hotel.currency ?? DEFAULT_CURRENCY;
+
+    // La chambre depuis la liste NON datée (présente même quand indisponible). Une chambre absente
+    // = 404 ; une panne (non-404) sur cette liste = dégradation de page (rethrow → 503).
+    const room = await this.findRoom(hotelId, roomId, ctx);
+    if (!room) {
+      throw new PmsRequestError('Chambre introuvable.', 404);
+    }
+
+    const { available, availabilityDegraded } =
+      await this.resolveRoomAvailability(
+        hotelId,
+        roomId,
+        room,
+        stay,
+        query.guests,
+        ctx,
+      );
+    const images = await this.roomPhotos(roomId, ctx);
+
+    const dto = this.toRoomDetailDto(
+      hotel,
+      room,
+      currency,
+      stay,
+      images,
+      available,
+      availabilityDegraded,
+    );
+
+    // Ne jamais cacher une réponse dégradée : une panne d'`/available` d'une seconde figerait la
+    // disponibilité de la chambre pour tous les visiteurs pendant tout le TTL.
+    if (!availabilityDegraded) {
+      await this.writeCache(cacheKey, dto);
+    }
+    return dto;
+  }
+
+  /**
+   * Trouve la chambre par id dans la liste **non datée** de l'hôtel (`/Rooms/hotel/{id}`), qui
+   * inclut TOUTES les chambres (même indisponibles). Un 404 = l'hôtel n'a pas de chambres → `null`
+   * (→ 404 fiche). Toute autre panne est rethrow (dégradation de page).
+   *
+   * ⚠️ Dette partagée avec 1.9 : `PageSize=100`, `hasNextPage` non lu. Au-delà de 100 chambres, la
+   * chambre cible peut être hors page → traitée comme introuvable ; c'est logué pour lever le doute.
+   */
+  private async findRoom(
+    hotelId: string,
+    roomId: string,
+    ctx: PmsRequestContext | undefined,
+  ): Promise<PmsRoom | null> {
+    try {
+      const res = await this.pms.getList<PmsRoom>(
+        `/Rooms/hotel/${hotelId}?PageSize=100`,
+        ctx,
+      );
+      const rooms = res.data ?? [];
+      const room = rooms.find((candidate) => candidate.id === roomId) ?? null;
+      if (!room) {
+        this.logger.warn(
+          `Chambre ${roomId} absente de l'hôtel ${hotelId} (${rooms.length} chambre(s) lue(s), PageSize=100).`,
+        );
+      }
+      return room;
+    } catch (err) {
+      // 404 = hôtel sans chambres → chambre introuvable ; sinon dégradation (rethrow → 503).
+      if (err instanceof PmsRequestError && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Disponibilité de la chambre pour les dates. **Avec dates** : appartenance au set réellement
+   * disponible du PMS (`/available`, qui filtre déjà statut + capacité). **Sans dates** : éligibilité
+   * statique (`status = Available` + prix > 0 + capacité). Une panne du cross-check daté **dégrade**
+   * (repli éligibilité statique + `availabilityDegraded=true`) — jamais « indisponible ».
+   */
+  private async resolveRoomAvailability(
+    hotelId: string,
+    roomId: string,
+    room: PmsRoom,
+    stay: StayDates | null,
+    guests: number | undefined,
+    ctx: PmsRequestContext | undefined,
+  ): Promise<{ available: boolean; availabilityDegraded: boolean }> {
+    if (!stay) {
+      return {
+        available: this.isEligibleRoom(room, null, guests),
+        availabilityDegraded: false,
+      };
+    }
+    try {
+      const res = await this.pms.getList<PmsRoom>(
+        `/Rooms/hotel/${hotelId}/available?${this.availableRoomsQuery(stay, guests)}`,
+        ctx,
+      );
+      // Garde-prix explicite : le set `/available` du PMS ne filtre pas un prix ≤ 0 aberrant.
+      const available =
+        this.hasSellablePrice(room) &&
+        (res.data ?? []).some((candidate) => candidate.id === roomId);
+      return { available, availabilityDegraded: false };
+    } catch (err) {
+      const status = err instanceof PmsRequestError ? err.status : null;
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(
+        `Disponibilité datée indéterminée pour la chambre ${roomId} (hôtel ${hotelId}, statut ${status ?? 'réseau/timeout'}) : ${message}`,
+      );
+      // Dégradation : repli sur l'éligibilité statique, jamais « indisponible pour ces dates ».
+      return {
+        available: this.isEligibleRoom(room, null, guests),
+        availabilityDegraded: true,
+      };
+    }
+  }
+
+  /** Photos de la chambre, triées primaire d'abord puis `displayOrder`. Best-effort : `[]` si panne. */
+  private async roomPhotos(
+    roomId: string,
+    ctx: PmsRequestContext | undefined,
+  ): Promise<RoomPhoto[]> {
+    try {
+      const res = await this.pms.get<PmsRoomImage[]>(
+        `/Files/rooms/${roomId}/images`,
+        ctx,
+      );
+      const usable = (res.data ?? []).filter(
+        (image): image is PmsRoomImage & { url: string } =>
+          typeof image.url === 'string' && image.url.length > 0,
+      );
+      return [...usable]
+        .sort((a, b) => {
+          if (Boolean(a.isPrimary) !== Boolean(b.isPrimary)) {
+            return a.isPrimary ? -1 : 1;
+          }
+          return (a.displayOrder ?? 0) - (b.displayOrder ?? 0);
+        })
+        .map((image) => ({ url: image.url }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(
+        `Images indisponibles pour la chambre ${roomId} — galerie vide. ${message}`,
+      );
+      return [];
+    }
+  }
+
+  private toRoomDetailDto(
+    hotel: PmsHotel,
+    room: PmsRoom,
+    currency: string,
+    stay: StayDates | null,
+    images: RoomPhoto[],
+    available: boolean,
+    availabilityDegraded: boolean,
+  ): RoomDetailDto {
+    // Unités mineures avec l'exposant RÉEL de la devise (cohérent avec `toRoomDto`/le front).
+    const pricePerNight = toMinorUnits(room.price ?? 0, currency);
+    return {
+      id: room.id ?? '',
+      hotelId: hotel.id ?? '',
+      hotelName: hotel.name ?? null,
+      hotelCity: hotel.city ?? null,
+      number: room.number ?? null,
+      category: room.category ?? null,
+      capacity: typeof room.capacity === 'number' ? room.capacity : null,
+      amenities: room.amenities ?? null,
+      floor: room.floor ?? null,
+      description: room.description ?? null,
+      includedServices: this.mapIncludedServices(room.includedServices),
+      images,
+      pricePerNight,
+      // Dérivé des unités mineures déjà arrondies (jamais un double arrondi depuis le décimal).
+      totalPrice: stay ? pricePerNight * stay.nights : null,
+      currency,
+      nights: stay ? stay.nights : null,
+      available,
+      availabilityDegraded,
+    };
+  }
+
+  /** Services inclus **actifs** et nommés (un service sans nom n'a rien à afficher). */
+  private mapIncludedServices(
+    services: PmsRoomIncludedService[] | null | undefined,
+  ): RoomIncludedService[] {
+    return (services ?? [])
+      .filter(
+        (service) =>
+          service.isActive !== false &&
+          typeof service.serviceName === 'string' &&
+          service.serviceName.trim().length > 0,
+      )
+      .map((service) => ({
+        name: (service.serviceName as string).trim(),
+        quantity:
+          typeof service.includedQuantity === 'number'
+            ? service.includedQuantity
+            : null,
+        notes: service.notes ?? null,
+      }));
+  }
+
+  private roomCacheKey(
+    hotelId: string,
+    roomId: string,
+    stay: StayDates | null,
+    guests: number | undefined,
+  ): string {
+    const normalized = JSON.stringify({
+      hotelId,
+      roomId,
+      checkInDate: stay?.checkInDate ?? null,
+      checkOutDate: stay?.checkOutDate ?? null,
+      guests: guests ?? null,
+    });
+    return (
+      ROOM_CACHE_PREFIX + createHash('sha1').update(normalized).digest('hex')
+    );
+  }
+
+  /**
    * Chambres pour les dates (endpoint public daté `/Rooms/hotel/{id}/available`, qui filtre déjà
    * statut + capacité) ou, **sans dates**, toutes les chambres (`/Rooms/hotel/{id}`, non daté) —
    * ce dernier ne filtrant **ni le statut ni la capacité**, le BFF doit le faire lui-même (sinon une
@@ -165,8 +426,7 @@ export class CatalogService {
     if (!room.id) {
       return false;
     }
-    const price = room.price;
-    if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
+    if (!this.hasSellablePrice(room)) {
       return false;
     }
     if (stay === null) {
@@ -178,6 +438,20 @@ export class CatalogService {
       }
     }
     return true;
+  }
+
+  /**
+   * Prix **vendable** : présent, fini et strictement positif. Un prix ≤ 0 / NaN (erreur de saisie
+   * PMS) ne doit jamais produire une chambre réservable — sinon la fiche afficherait un prix négatif
+   * et un CTA « Réserver » actif vers le tunnel. Le set daté `/available` du PMS ne garantit pas ce
+   * filtre (contrairement à `isEligibleRoom`), d'où le contrôle explicite aussi sur ce chemin.
+   */
+  private hasSellablePrice(room: PmsRoom): boolean {
+    return (
+      typeof room.price === 'number' &&
+      Number.isFinite(room.price) &&
+      room.price > 0
+    );
   }
 
   /**
