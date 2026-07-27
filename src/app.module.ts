@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_PIPE } from '@nestjs/core';
 import { LoggerModule } from 'nestjs-pino';
 import { AppController } from './app.controller';
@@ -22,8 +23,22 @@ import { HealthModule } from './modules/health/health.module';
 // health check. PmsModule (1.2) = frontière PMS. SearchModule (1.6) = 1ʳᵉ route métier ; la
 // story pose aussi la frontière HTTP globale (ValidationPipe + filtre d'exceptions), enregistrée
 // via APP_PIPE/APP_FILTER pour s'appliquer partout, y compris dans les tests e2e.
+//
+// `ConfigModule.forRoot` (story 2.1) charge `.env` dans `process.env` **au chargement du module**,
+// donc avant toute `useFactory` (dont `resolveAuthOptions`, fail-fast sur `SESSION_SECRET`).
+// Il ne remplace PAS le pattern « fonction pure + process.env » déjà en place (`resolvePmsClientOptions`,
+// `resolveCatalogOptions`…) : il rend simplement le fichier `.env` — jusqu'ici jamais lu — effectif.
+// Les variables déjà présentes dans l'environnement gardent la priorité (ex. `CORS_ORIGIN` injecté
+// par `scripts/client-stack-up.ps1`, valeurs posées par les tests e2e).
 @Module({
   imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      // En test, le `.env` local (gitignoré, propre à la machine) ne doit PAS être chargé :
+      // il coupleraient les 9 suites e2e qui bootent AppModule à un fichier non versionné.
+      // Les valeurs de test sont posées par `test/setup-env.ts`.
+      ignoreEnvFile: process.env.NODE_ENV === 'test',
+    }),
     LoggerModule.forRoot({ pinoHttp: pinoHttpOptions }),
     CorrelationModule,
     RedisModule,

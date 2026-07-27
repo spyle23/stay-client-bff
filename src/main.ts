@@ -13,9 +13,12 @@ async function bootstrap() {
   app.useLogger(app.get(Logger));
   // Sécurité : en-têtes HTTP durcis (dépendance helmet requise par le socle).
   app.use(helmet());
-  // CORS : le front (origine distincte :3000) doit pouvoir appeler le BFF avec cookies de session.
+  // CORS : le front cliente (origine distincte **:3001** — :3000 est le back-office Stay) doit
+  // pouvoir appeler le BFF avec le cookie de session. ⚠️ Avec `credentials: true` + cookie
+  // HttpOnly, une origine erronée casse la session **silencieusement** (le navigateur rejette la
+  // réponse sans erreur applicative) : le défaut doit donc pointer le vrai front cliente.
   app.enableCors({
-    origin: process.env.CORS_ORIGIN ?? 'http://localhost:3000',
+    origin: process.env.CORS_ORIGIN ?? 'http://localhost:3001',
     credentials: true,
   });
   // /health et /health/live hors du préfixe versionné (sondes infra Docker/k8s) ; le reste sous /api/v1.

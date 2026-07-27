@@ -23,6 +23,11 @@ export const REDACTED_PATHS = [
   '*.authorization',
   '*.password',
   '*.newPassword',
+  // Jetons de session (story 2.1) : la custody garde les JWT côté serveur — ils ne doivent
+  // pas non plus fuir par les logs. ⚠️ Un seul niveau : ne JAMAIS logger l'objet session
+  // entier (`session.accessToken` serait masqué, `x.session.accessToken` non).
+  '*.accessToken',
+  '*.refreshToken',
   '*.clientSecret',
   '*.cardNumber',
   '*.card',
