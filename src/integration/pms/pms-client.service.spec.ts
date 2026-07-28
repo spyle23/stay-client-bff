@@ -143,6 +143,63 @@ describe('PmsClientService', () => {
       );
       expect(nock.isDone()).toBe(true); // 1 essai + 2 retries
     });
+
+    // Écritures non idempotentes (story 2.3) : rejouer `register/customer` après une réponse
+    // perdue transforme un succès en « email déjà pris » — un compte créé que personne ne peut
+    // plus ouvrir. L'appelant doit pouvoir désactiver le retry pour ces routes-là.
+    it('maxRetries: 0 → un seul appel HTTP sur 5xx, puis PmsUnavailableError', async () => {
+      const svc = createService();
+      // Deux interceptions armées : si le client retryait, la seconde serait consommée.
+      const scope = nock(HOST)
+        .post('/api/v1/auth/register/customer')
+        .reply(503, {})
+        .post('/api/v1/auth/register/customer')
+        .reply(201, { success: true, data: { userId: 'u1' } });
+
+      await expect(
+        svc.post(
+          '/auth/register/customer',
+          { email: 'a@b.c' },
+          {
+            maxRetries: 0,
+          },
+        ),
+      ).rejects.toBeInstanceOf(PmsUnavailableError);
+      expect(scope.pendingMocks()).toHaveLength(1); // la 2ᵉ n'a jamais été appelée
+    });
+
+    it('maxRetries: 0 → un seul appel HTTP sur erreur réseau', async () => {
+      const svc = createService();
+      // `pendingMocks()` dédoublonne les interceptions identiques : il ne peut pas prouver un
+      // nombre d'appels. On compte les requêtes réellement émises.
+      let calls = 0;
+      const scope = nock(HOST)
+        .post('/api/v1/auth/register/customer')
+        .times(3)
+        .replyWithError('ECONNRESET');
+      scope.on('request', () => {
+        calls += 1;
+      });
+
+      await expect(
+        svc.post('/auth/register/customer', {}, { maxRetries: 0 }),
+      ).rejects.toBeInstanceOf(PmsUnavailableError);
+      expect(calls).toBe(1); // aucun retry malgré 3 interceptions armées
+    });
+
+    it('sans override, le comportement de retry par défaut est inchangé', async () => {
+      const svc = createService();
+      nock(HOST)
+        .post('/api/v1/reservations')
+        .reply(503, {})
+        .post('/api/v1/reservations')
+        .reply(200, { success: true, data: { id: 'r1' } });
+
+      const res = await svc.post<{ id: string }>('/reservations', {});
+
+      expect(res.data).toEqual({ id: 'r1' });
+      expect(nock.isDone()).toBe(true);
+    });
   });
 
   describe('idempotence des écritures', () => {

@@ -49,6 +49,17 @@ export interface PmsRequestContext {
   idempotencyKey?: string;
   /** En-têtes additionnels (ex. `X-Service-Key` fourni par `ServiceKeyProvider`). */
   headers?: Record<string, string>;
+  /**
+   * Plafond de retries **pour cet appel** (défaut : `PmsClientOptions.maxRetries`).
+   *
+   * À poser à `0` sur les **écritures non idempotentes que le PMS n'idempotente pas**
+   * (l'en-tête `Idempotency-Key` est envoyé mais Stay-api l'ignore aujourd'hui). Cas réel :
+   * `POST /auth/register/customer` (story 2.3) — si la réponse se perd après création, la
+   * tentative suivante revient en « Email is already registered. » et le voyageur se voit
+   * refuser un compte qui vient d'être créé pour lui, dont personne ne connaît le mot de passe.
+   * Un 503 rejouable par l'utilisateur est préférable à cette impasse définitive.
+   */
+  maxRetries?: number;
 }
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -66,7 +77,10 @@ const MAX_BACKOFF_MS = 30_000;
 export class PmsClientService {
   private readonly logger = new Logger(PmsClientService.name);
   private readonly http: AxiosInstance;
-  private readonly breaker: CircuitBreaker<[AxiosRequestConfig], AxiosResponse>;
+  private readonly breaker: CircuitBreaker<
+    [AxiosRequestConfig, number],
+    AxiosResponse
+  >;
 
   constructor(
     @Inject(PMS_CLIENT_OPTIONS) private readonly options: PmsClientOptions,
@@ -79,7 +93,8 @@ export class PmsClientService {
     });
 
     this.breaker = new CircuitBreaker(
-      (config: AxiosRequestConfig) => this.executeWithRetries(config),
+      (config: AxiosRequestConfig, maxRetries: number) =>
+        this.executeWithRetries(config, maxRetries),
       {
         // Le timeout est porté par axios (par tentative) ; le breaker ne mesure que les échecs.
         timeout: false,
@@ -90,7 +105,8 @@ export class PmsClientService {
         errorFilter: (err: unknown) => err instanceof PmsRequestError,
       },
     );
-    this.breaker.fallback((_config: AxiosRequestConfig, err: unknown) => {
+    // opossum transmet au fallback les arguments de l'action **puis** l'erreur en dernier.
+    this.breaker.fallback((_config: AxiosRequestConfig, _max, err: unknown) => {
       if (
         err instanceof PmsRequestError ||
         err instanceof PmsUnavailableError
@@ -171,7 +187,7 @@ export class PmsClientService {
     // Config construite UNE fois → l'Idempotency-Key reste stable sur toutes les tentatives de retry.
     const config = this.buildConfig(method, path, body, ctx);
     try {
-      return await this.breaker.fire(config);
+      return await this.breaker.fire(config, this.resolveMaxRetries(ctx));
     } catch (err) {
       if (
         err instanceof PmsRequestError ||
@@ -215,14 +231,27 @@ export class PmsClientService {
   }
 
   /**
+   * Plafond de retries effectif : override d'appel s'il est fourni et exploitable, sinon la
+   * configuration globale. Une valeur négative ou non finie retombe sur le défaut (une faute de
+   * frappe ne doit pas silencieusement désactiver la résilience de tout le BFF).
+   */
+  private resolveMaxRetries(ctx: PmsRequestContext): number {
+    const override = ctx.maxRetries;
+    return override !== undefined && Number.isInteger(override) && override >= 0
+      ? override
+      : this.options.maxRetries;
+  }
+
+  /**
    * Exécute la requête avec retries backoff. Retry uniquement sur erreurs réseau/timeout et 5xx.
    * 4xx métier → `PmsRequestError` (non retryé). Retries épuisés → `PmsUnavailableError`.
    */
   private async executeWithRetries(
     config: AxiosRequestConfig,
+    maxRetries: number,
   ): Promise<AxiosResponse> {
     let lastCause: unknown;
-    for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
         await this.delay(this.backoffDelay(attempt));
       }
@@ -234,7 +263,7 @@ export class PmsClientService {
         // Erreur réseau / timeout → retryable.
         lastCause = err;
         this.logger.warn(
-          `PMS ${config.method ?? '?'} ${config.url ?? '?'} — échec réseau (tentative ${attempt + 1}/${this.options.maxRetries + 1})`,
+          `PMS ${config.method ?? '?'} ${config.url ?? '?'} — échec réseau (tentative ${attempt + 1}/${maxRetries + 1})`,
         );
         continue;
       }
@@ -242,7 +271,7 @@ export class PmsClientService {
       if (res.status >= 500) {
         lastCause = new Error(`Le PMS a répondu ${res.status}`);
         this.logger.warn(
-          `PMS ${config.method ?? '?'} ${config.url ?? '?'} — ${res.status} (tentative ${attempt + 1}/${this.options.maxRetries + 1})`,
+          `PMS ${config.method ?? '?'} ${config.url ?? '?'} — ${res.status} (tentative ${attempt + 1}/${maxRetries + 1})`,
         );
         continue;
       }

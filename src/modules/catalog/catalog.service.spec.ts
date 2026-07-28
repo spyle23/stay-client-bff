@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import type { CorrelationService } from '../../common/correlation/correlation.service';
 import type {
   ApiListResponse,
@@ -613,6 +614,73 @@ describe('CatalogService', () => {
       expect(dto.available).toBe(false);
       expect(dto.availabilityDegraded).toBe(false);
       expect(dto.pricePerNight).toBe(12000); // la fiche reste affichable
+    });
+
+    /**
+     * Story 2.2 : le BFF arrondit le tarif PUIS multiplie par les nuits, le PMS multiplie en
+     * `decimal` PUIS arrondit. Un tarif plus précis que la devise fait diverger les deux totaux —
+     * le voyageur verrait un total annoncé ≠ total facturé. Le cas doit être **détectable**.
+     */
+    it('signale un tarif PMS plus précis que la devise (divergence de total possible)', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 84.005, capacity: 2, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: 84.005, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(dto.pricePerNight).toBe(8401); // arrondi à l'unité mineure
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('plus précis'));
+      warn.mockRestore();
+    });
+
+    /**
+     * Revue 2.2 : `hotel.currency ?? DEFAULT_CURRENCY` ne capte que `null`/`undefined`. Une colonne
+     * renseignée à `''` traverserait tout le contrat : exposant d'unités mineures replié à 2 en
+     * silence, et un « Total » affiché SANS devise côté front — contraire à AR-12.
+     */
+    it('remplace une devise vide par le repli plutôt que de la propager', async () => {
+      hotelFixture = { id: HOTEL_ID, name: 'Hôtel Test', currency: '   ' };
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 84, capacity: 2, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: 84, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(dto.currency).toBe('EUR');
+      expect(dto.pricePerNight).toBe(8400);
+    });
+
+    it('normalise la casse de la devise de l’Hôtel', async () => {
+      hotelFixture = { id: HOTEL_ID, name: 'Hôtel Test', currency: 'mga' };
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 250_000, capacity: 2, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: 250_000, status: AVAILABLE }],
+      });
+
+      const dto = await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      // MGA = 0 décimale : sans normalisation de casse, l'ICU ne résoudrait pas l'exposant et le
+      // montant serait multiplié par 100.
+      expect(dto.currency).toBe('MGA');
+      expect(dto.pricePerNight).toBe(250_000);
+    });
+
+    it('reste muet pour un tarif exprimable dans la devise', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      dispatchRooms({
+        list: [{ id: ROOM_ID, price: 84.1, capacity: 2, status: AVAILABLE }],
+        available: [{ id: ROOM_ID, price: 84.1, status: AVAILABLE }],
+      });
+
+      await service.getRoomDetail(HOTEL_ID, ROOM_ID, datedQuery);
+
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('plus précis'),
+      );
+      warn.mockRestore();
     });
 
     /** Garde-prix : une chambre au prix ≤ 0 (saisie PMS aberrante) n'est jamais réservable, même

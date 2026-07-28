@@ -35,6 +35,8 @@ describe('logger redaction', () => {
         },
         payment: { clientSecret: 'sk_live_XYZ' },
         user: { password: 'p@ssw0rd' },
+        // Provisioning invité (story 2.3) : `register/customer` exige les DEUX champs.
+        guest: { password: 'Genere1!', confirmPassword: 'Genere1!' },
       },
       'requête test',
     );
@@ -44,6 +46,7 @@ describe('logger redaction', () => {
     expect(out).not.toContain('super-secret');
     expect(out).not.toContain('sk_live_XYZ');
     expect(out).not.toContain('p@ssw0rd');
+    expect(out).not.toContain('Genere1!');
   });
 
   it('masque les jetons de session et le Set-Cookie (custody — story 2.1, AC-6)', () => {

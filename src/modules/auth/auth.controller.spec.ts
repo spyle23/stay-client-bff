@@ -1,10 +1,20 @@
-import { ForbiddenException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  type HttpException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import { PmsRequestError } from '../../integration/pms/pms-errors';
 import type { AuthOptions } from './auth.constants';
 import { AuthController } from './auth.controller';
 import { buildSessionCookieValue, generateSessionId } from './session-cookie';
-import type { SessionRecord, SessionService } from './session.service';
+import {
+  GuestEmailConflictError,
+  type SessionRecord,
+  type SessionService,
+} from './session.service';
 
 const OPTIONS: AuthOptions = {
   sessionSecret: 'secret-de-test-suffisamment-long-0123456789',
@@ -41,13 +51,21 @@ function makeResponse() {
 describe('AuthController', () => {
   let sessions: {
     login: jest.Mock;
+    provisionGuest: jest.Mock;
     read: jest.Mock;
+    destroy: jest.Mock;
     logout: jest.Mock;
   };
   let controller: AuthController;
 
   beforeEach(() => {
-    sessions = { login: jest.fn(), read: jest.fn(), logout: jest.fn() };
+    sessions = {
+      login: jest.fn(),
+      provisionGuest: jest.fn(),
+      read: jest.fn().mockResolvedValue(null),
+      destroy: jest.fn(),
+      logout: jest.fn(),
+    };
     controller = new AuthController(
       sessions as unknown as SessionService,
       OPTIONS,
@@ -140,6 +158,161 @@ describe('AuthController', () => {
           res as unknown as Response,
         ),
       ).rejects.toMatchObject({ status: 429 });
+    });
+  });
+
+  describe('guest (story 2.3 — FR-8)', () => {
+    const BODY = {
+      email: 'invite@example.com',
+      firstName: 'Hery',
+      lastName: 'Rakoto',
+      phone: '+261340000000',
+    };
+    const GUEST_USER = {
+      userId: 'u-9',
+      email: 'invite@example.com',
+      firstName: 'Hery',
+      lastName: 'Rakoto',
+    };
+    /** Requête factice porteuse (ou non) d'un en-tête `Cookie`. */
+    const requestWith = (cookie?: string) =>
+      ({ headers: cookie ? { cookie } : {} }) as unknown as Parameters<
+        AuthController['guest']
+      >[1];
+
+    it('provisionne, pose le cookie et ne renvoie ni jeton ni mot de passe', async () => {
+      sessions.provisionGuest.mockResolvedValue({
+        sid: 'sid-guest',
+        ttlSeconds: 3600,
+        user: GUEST_USER,
+      });
+      const res = makeResponse();
+
+      const body = await controller.guest(
+        BODY,
+        requestWith(),
+        res as unknown as Response,
+      );
+
+      const cookie = res.headers.get('Set-Cookie') ?? '';
+      expect(cookie).toContain('stay_sid=');
+      expect(cookie).toContain('HttpOnly');
+      expect(cookie).toContain('SameSite=Lax');
+      expect(body).toEqual({
+        success: true,
+        data: { authenticated: true, user: GUEST_USER },
+      });
+      expect(JSON.stringify(body)).not.toMatch(/token|password/i);
+      // Toute réponse d'auth est non cacheable (identité + cookie).
+      expect(res.headers.get('Cache-Control')).toBe('no-store, private');
+    });
+
+    it('collision d’email → 409 générique, SANS cookie', async () => {
+      sessions.provisionGuest.mockRejectedValue(new GuestEmailConflictError());
+      const res = makeResponse();
+
+      const failure = controller.guest(
+        BODY,
+        requestWith(),
+        res as unknown as Response,
+      );
+
+      await expect(failure).rejects.toBeInstanceOf(ConflictException);
+      expect(res.headers.get('Set-Cookie')).toBeUndefined();
+    });
+
+    /**
+     * ⚠️ Le test précédent ne peut PAS prouver l'absence de fuite : `GuestEmailConflictError`
+     * porte un message français codé en dur, donc toute assertion « ne contient pas le texte du
+     * PMS » y serait vraie quelle que soit l'implémentation. La fuite ne peut venir que d'une
+     * `PmsRequestError` **relayée telle quelle** — c'est donc ce cas qu'il faut éprouver.
+     */
+    it('un 4xx du PMS ne relaie NI son message NI ses `errors` au navigateur', async () => {
+      sessions.provisionGuest.mockRejectedValue(
+        new PmsRequestError('Le PMS a renvoyé le statut 400.', 400, {
+          errors: ['Email is already registered.'],
+          responseBody: { message: null, errors: ['First name is required.'] },
+        }),
+      );
+      const res = makeResponse();
+
+      const failure = controller.guest(
+        BODY,
+        requestWith(),
+        res as unknown as Response,
+      );
+
+      await expect(failure).rejects.toBeInstanceOf(BadRequestException);
+      const error = await failure.catch((e: HttpException) => e);
+      expect(
+        JSON.stringify((error as HttpException).getResponse()),
+      ).not.toMatch(/already registered|First name is required|statut 400/i);
+      expect(res.headers.get('Set-Cookie')).toBeUndefined();
+    });
+
+    it('session déjà ouverte sur le MÊME email → aucun appel PMS (double soumission)', async () => {
+      const sid = generateSessionId();
+      sessions.read.mockResolvedValue({
+        ...RECORD,
+        email: 'invite@example.com',
+        firstName: 'Hery',
+        lastName: 'Rakoto',
+        userId: 'u-9',
+      });
+      const res = makeResponse();
+
+      const body = await controller.guest(
+        BODY,
+        requestWith(
+          `stay_sid=${buildSessionCookieValue(sid, OPTIONS.sessionSecret)}`,
+        ),
+        res as unknown as Response,
+      );
+
+      expect(sessions.provisionGuest).not.toHaveBeenCalled();
+      expect(body).toEqual({
+        success: true,
+        data: { authenticated: true, user: GUEST_USER },
+      });
+    });
+
+    it('session ouverte sur un AUTRE email → provisionne et détruit la session entrante', async () => {
+      const sid = generateSessionId();
+      sessions.read.mockResolvedValue({
+        ...RECORD,
+        email: 'autre@example.com',
+      });
+      sessions.provisionGuest.mockResolvedValue({
+        sid: 'sid-guest',
+        ttlSeconds: 3600,
+        user: GUEST_USER,
+      });
+      const res = makeResponse();
+
+      await controller.guest(
+        BODY,
+        requestWith(
+          `stay_sid=${buildSessionCookieValue(sid, OPTIONS.sessionSecret)}`,
+        ),
+        res as unknown as Response,
+      );
+
+      expect(sessions.provisionGuest).toHaveBeenCalledTimes(1);
+      // Sans destruction, la session précédente (porteuse de JWT) survivrait jusqu'à 7 jours
+      // et le tunnel porterait deux identités concurrentes.
+      expect(sessions.destroy).toHaveBeenCalledWith(sid);
+    });
+
+    it('laisse passer un refus de rôle sans poser de cookie', async () => {
+      sessions.provisionGuest.mockRejectedValue(
+        new ForbiddenException('rôle refusé'),
+      );
+      const res = makeResponse();
+
+      await expect(
+        controller.guest(BODY, requestWith(), res as unknown as Response),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(res.headers.get('Set-Cookie')).toBeUndefined();
     });
   });
 

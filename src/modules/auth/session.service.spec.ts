@@ -1,5 +1,6 @@
 import {
   ForbiddenException,
+  Logger,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -16,7 +17,10 @@ import {
   REFRESH_LOCK_PREFIX,
   SESSION_KEY_PREFIX,
 } from './auth.constants';
+import { satisfiesPmsPasswordPolicy } from './guest-password';
 import {
+  GUEST_ACCOUNT_ORPHANED_CODE,
+  GuestEmailConflictError,
   type PmsAuthResponse,
   PMS_AUTH_ENDPOINTS,
   SessionService,
@@ -130,6 +134,210 @@ describe('SessionService', () => {
       correlation,
       OPTIONS,
     );
+  });
+
+  describe('provisionGuest (story 2.3 — FR-8)', () => {
+    const GUEST = {
+      email: 'invite@example.com',
+      firstName: 'Hery',
+      lastName: 'Rakoto',
+      phone: '+261340000000',
+    };
+
+    it('crée le compte léger puis la session, sans exposer le mot de passe généré', async () => {
+      pms.post.mockResolvedValue({
+        success: true,
+        data: authResponse({ email: GUEST.email }),
+      });
+
+      const result = await service.provisionGuest(GUEST);
+
+      expect(pms.post).toHaveBeenCalledTimes(1);
+      const [path, body, ctx] = pms.post.mock.calls[0] as [
+        string,
+        Record<string, string>,
+        Record<string, unknown>,
+      ];
+      expect(path).toBe(PMS_AUTH_ENDPOINTS.registerCustomer);
+      expect(body).toMatchObject({
+        email: GUEST.email,
+        firstName: 'Hery',
+        lastName: 'Rakoto',
+        phone: '+261340000000',
+      });
+      // `ConfirmPassword` est NotEmpty + Equal(Password) côté PMS : l'omettre produirait un 400
+      // de validation, indiscernable d'une collision d'email.
+      expect(body.confirmPassword).toBe(body.password);
+      expect(satisfiesPmsPasswordPolicy(body.password)).toBe(true);
+      // Écriture non idempotente : un rejeu après réponse perdue reviendrait en « email déjà
+      // pris » sur un compte que personne ne peut ouvrir (AC-10).
+      expect(ctx).toMatchObject({ maxRetries: 0 });
+
+      expect(result.user.email).toBe(GUEST.email);
+      expect(JSON.stringify(result.user)).not.toContain(body.password);
+      expect(redis.store.get(SESSION_KEY_PREFIX + result.sid)).toBeDefined();
+      // Le mot de passe généré ne doit pas non plus être persisté en session.
+      expect(redis.store.get(SESSION_KEY_PREFIX + result.sid)).not.toContain(
+        body.password,
+      );
+    });
+
+    it('tire un mot de passe différent à chaque provisioning', async () => {
+      pms.post.mockResolvedValue({ success: true, data: authResponse() });
+
+      await service.provisionGuest(GUEST);
+      await service.provisionGuest({ ...GUEST, email: 'autre@example.com' });
+
+      const [, first] = pms.post.mock.calls[0] as [
+        string,
+        { password: string },
+      ];
+      const [, second] = pms.post.mock.calls[1] as [
+        string,
+        { password: string },
+      ];
+      expect(first.password).not.toBe(second.password);
+    });
+
+    /**
+     * ⚠️ Forme **réelle** de la réponse du PMS, relevée en Phase 3 :
+     * `{"success":false,"message":null,"errors":["Email is already registered."]}`.
+     * Le motif vit dans `errors`, pas dans `message` — une fixture qui le placerait dans
+     * `message` rendrait le test vert alors que la production ne détecte rien.
+     */
+    const conflictError = () =>
+      new PmsRequestError('Le PMS a renvoyé le statut 400.', 400, {
+        errors: ['Email is already registered.'],
+        responseBody: {
+          success: false,
+          message: null,
+          errors: ['Email is already registered.'],
+        },
+      });
+
+    it('collision d’email → GuestEmailConflictError, sans session ni cookie', async () => {
+      pms.post.mockRejectedValue(conflictError());
+
+      await expect(service.provisionGuest(GUEST)).rejects.toBeInstanceOf(
+        GuestEmailConflictError,
+      );
+      expect(redis.store.size).toBe(0);
+      expect(redis.set).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['errors en tableau', { errors: ['Email is already registered.'] }],
+      [
+        'errors par champ',
+        { errors: { email: ['Email is already registered.'] } },
+      ],
+      ['casse différente', { errors: ['EMAIL IS ALREADY REGISTERED.'] }],
+      ['ponctuation absente', { errors: ['Email is already registered'] }],
+    ])('reconnaît la collision — %s', async (_cas, options) => {
+      pms.post.mockRejectedValue(
+        new PmsRequestError('Le PMS a renvoyé le statut 400.', 400, options),
+      );
+
+      await expect(service.provisionGuest(GUEST)).rejects.toBeInstanceOf(
+        GuestEmailConflictError,
+      );
+    });
+
+    it('reconnaît aussi la collision portée par `message` (contrat futur)', async () => {
+      pms.post.mockRejectedValue(
+        new PmsRequestError('Email is already registered.', 400),
+      );
+
+      await expect(service.provisionGuest(GUEST)).rejects.toBeInstanceOf(
+        GuestEmailConflictError,
+      );
+    });
+
+    it('un 400 de validation N’EST PAS une collision (propagé tel quel)', async () => {
+      const err = new PmsRequestError('Le PMS a renvoyé le statut 400.', 400, {
+        errors: ['First name is required.'],
+      });
+      pms.post.mockRejectedValue(err);
+
+      await expect(service.provisionGuest(GUEST)).rejects.toBe(err);
+    });
+
+    it('refuse un rôle non-Customer SANS créer de session', async () => {
+      pms.post.mockResolvedValue({
+        success: true,
+        data: authResponse({ role: 2 }),
+      });
+
+      await expect(service.provisionGuest(GUEST)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      expect(redis.store.size).toBe(0);
+    });
+
+    it('propage une panne PMS (503) sans la convertir en collision', async () => {
+      pms.post.mockRejectedValue(new PmsUnavailableError('PMS injoignable'));
+
+      await expect(service.provisionGuest(GUEST)).rejects.toBeInstanceOf(
+        PmsUnavailableError,
+      );
+    });
+
+    /**
+     * Le compte PMS est **déjà créé** quand la session échoue : présenter cet échec comme une
+     * panne ordinaire (« réessayez ») envoie le voyageur droit sur un 409 portant un compte que
+     * personne ne peut ouvrir. Le code machine permet au front de dire autre chose.
+     */
+    it('panne Redis après création → 503 marqué « compte créé » (jamais 500)', async () => {
+      pms.post.mockResolvedValue({ success: true, data: authResponse() });
+      redis.set.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+      const failure = await service
+        .provisionGuest(GUEST)
+        .catch((err: unknown) => err);
+
+      expect(failure).toBeInstanceOf(ServiceUnavailableException);
+      const body = (failure as ServiceUnavailableException).getResponse();
+      expect(body).toMatchObject({
+        errors: { reason: [GUEST_ACCOUNT_ORPHANED_CODE] },
+      });
+    });
+
+    it('réponse d’auth PMS incomplète après création → même marquage « compte créé »', async () => {
+      // Le compte existe (201 reçu) mais le contrat est rompu : c'est un orphelin, pas un refus.
+      pms.post.mockResolvedValue({
+        success: true,
+        data: authResponse({ refreshToken: null }),
+      });
+
+      const failure = await service
+        .provisionGuest(GUEST)
+        .catch((err: unknown) => err);
+
+      expect(failure).toBeInstanceOf(ServiceUnavailableException);
+      expect(
+        (failure as ServiceUnavailableException).getResponse(),
+      ).toMatchObject({ errors: { reason: [GUEST_ACCOUNT_ORPHANED_CODE] } });
+    });
+
+    it('journalise l’orphelin avec de quoi le rattraper, sans jamais de jeton', async () => {
+      const logged: string[] = [];
+      jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation((message: unknown) => {
+          logged.push(String(message));
+        });
+      pms.post.mockResolvedValue({ success: true, data: authResponse() });
+      redis.set.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+      await service.provisionGuest(GUEST).catch(() => undefined);
+
+      const alert = logged.join(' | ');
+      expect(alert).toContain(GUEST.email);
+      expect(alert).toContain('u-1');
+      expect(alert).not.toContain('access-1');
+      expect(alert).not.toContain('refresh-1');
+      jest.restoreAllMocks();
+    });
   });
 
   describe('login', () => {

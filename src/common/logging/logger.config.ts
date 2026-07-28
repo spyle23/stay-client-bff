@@ -23,6 +23,9 @@ export const REDACTED_PATHS = [
   '*.authorization',
   '*.password',
   '*.newPassword',
+  // Mot de passe généré du compte léger invité (story 2.3) : `register/customer` exige les DEUX
+  // champs — masquer `password` seul laisserait le secret en clair sous `confirmPassword`.
+  '*.confirmPassword',
   // Jetons de session (story 2.1) : la custody garde les JWT côté serveur — ils ne doivent
   // pas non plus fuir par les logs. ⚠️ Un seul niveau : ne JAMAIS logger l'objet session
   // entier (`session.accessToken` serait masqué, `x.session.accessToken` non).

@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { toMinorUnits } from '../../common/money/minor-units';
+import {
+  hasSubMinorPrecision,
+  toMinorUnits,
+} from '../../common/money/minor-units';
 import { CorrelationService } from '../../common/correlation/correlation.service';
 import {
   type PmsRequestContext,
@@ -36,6 +39,19 @@ const ROOM_CACHE_PREFIX = 'catalog:room:v1:';
 const MS_PER_DAY = 86_400_000;
 /** Devise par défaut du PMS quand un hôtel n'en porte pas (Stay-api : `Hotel.Currency` défaut EUR). */
 const DEFAULT_CURRENCY = 'EUR';
+
+/**
+ * Devise d'hôtel exploitable, ou repli. `??` seul laisserait passer une chaîne **vide** (colonne
+ * renseignée à `''` plutôt qu'à `NULL`) : le montant serait alors converti avec un exposant replié
+ * en silence, et le front afficherait un total **sans devise** — contraire à AR-12, qui exige que
+ * la devise accompagne toujours le montant (revue 2.2).
+ */
+function normaliseCurrency(currency: string | null | undefined): string {
+  const trimmed = currency?.trim();
+  return trimmed !== undefined && trimmed.length > 0
+    ? trimmed.toUpperCase()
+    : DEFAULT_CURRENCY;
+}
 /** `RoomStatus.Available` (Stay-api : Available=1, Occupied=2, Maintenance=3, Cleaning=4, OutOfService=5). */
 const ROOM_STATUS_AVAILABLE = 1;
 
@@ -95,7 +111,7 @@ export class CatalogService {
 
     // Devise résolue **une seule fois** : l'hôtel et ses chambres portent la MÊME devise (jamais
     // `null` d'un côté et une devise fabriquée de l'autre).
-    const currency = hotel.currency ?? DEFAULT_CURRENCY;
+    const currency = normaliseCurrency(hotel.currency);
 
     const { rooms, roomsUnavailable } = await this.fetchRooms(
       id,
@@ -155,7 +171,10 @@ export class CatalogService {
     if (!hotel || !hotel.id) {
       throw new PmsRequestError('Hôtel introuvable.', 404);
     }
-    const currency = hotel.currency ?? DEFAULT_CURRENCY;
+    // `??` ne suffit pas : une devise **vide** (`''` en base, pas `NULL`) traverserait le contrat
+    // jusqu'au navigateur — exposant d'unités mineures replié à 2 en silence, et un « Total »
+    // affiché sans devise, contraire à AR-12 (« la devise est toujours transportée »).
+    const currency = normaliseCurrency(hotel.currency);
 
     // La chambre depuis la liste NON datée (présente même quand indisponible). Une chambre absente
     // = 404 ; une panne (non-404) sur cette liste = dégradation de page (rethrow → 503).
@@ -314,11 +333,22 @@ export class CatalogService {
   ): RoomDetailDto {
     // Unités mineures avec l'exposant RÉEL de la devise (cohérent avec `toRoomDto`/le front).
     const pricePerNight = toMinorUnits(room.price ?? 0, currency);
+    // Le tarif est arrondi ICI puis multiplié par les nuits, alors que le PMS multiplie en
+    // `decimal` puis persiste : un tarif plus précis que la devise fait diverger les deux totaux.
+    // Rare, mais invisible sans ce log — et le voyageur verrait un total annoncé ≠ total facturé.
+    // (Vérification bloquante à la création : story 2.4.)
+    if (hasSubMinorPrecision(room.price ?? 0, currency)) {
+      this.logger.warn(
+        `Tarif ${room.price} ${currency} plus précis que la devise (chambre ${room.id}, hôtel ${hotel.id}) : ` +
+          `le total du récapitulatif peut diverger du total calculé par le PMS à la création.`,
+      );
+    }
     return {
       id: room.id ?? '',
       hotelId: hotel.id ?? '',
       hotelName: hotel.name ?? null,
       hotelCity: hotel.city ?? null,
+      hotelLogoUrl: hotel.logoUrl ?? null,
       number: room.number ?? null,
       category: room.category ?? null,
       capacity: typeof room.capacity === 'number' ? room.capacity : null,

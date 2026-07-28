@@ -12,6 +12,10 @@
  * Le front décode symétriquement (`stay-client/src/lib/currency.ts#minorUnitExponent`).
  */
 
+import { Logger } from '@nestjs/common';
+
+const logger = new Logger('MinorUnits');
+
 /** Chemin rapide (évite de construire un `Intl.NumberFormat` pour les devises courantes). */
 const FAST_PATH: Record<string, number> = { EUR: 2, USD: 2 };
 
@@ -40,7 +44,14 @@ export function minorUnitExponent(currency: string): number {
       exponent = resolved.maximumFractionDigits;
     }
   } catch {
+    // Code hors ISO 4217 (ou vide) : repli sûr sur 2 décimales, mais **jamais en silence** — un
+    // montant converti avec le mauvais exposant est faux d'un facteur 10^n, et le symptôme
+    // n'apparaîtrait qu'à l'écran (revue 2.2).
     exponent = 2;
+    logger.warn(
+      `Devise « ${currency} » inconnue de l'ICU : exposant d'unités mineures replié sur 2. ` +
+        `Les montants exprimés dans cette devise peuvent être faux d'un facteur 10^n.`,
+    );
   }
   derivedCache.set(currency, exponent);
   return exponent;
@@ -49,4 +60,31 @@ export function minorUnitExponent(currency: string): number {
 /** Convertit un montant **décimal** (tel que renvoyé par le PMS) en unités mineures entières. */
 export function toMinorUnits(amount: number, currency: string): number {
   return Math.round(amount * 10 ** minorUnitExponent(currency));
+}
+
+/**
+ * Vrai si `amount` porte **plus de décimales que la devise n'en admet** (ex. `84.005` en EUR).
+ *
+ * Pourquoi c'est important (story 2.2) : le BFF arrondit le tarif **puis** multiplie par les nuits
+ * (`toMinorUnits(prix) × nuits`) — c'est ce qui garde le total affiché cohérent avec le prix/nuit
+ * affiché. Le PMS, lui, multiplie en `decimal` **puis** persiste
+ * (`RoomReservationService.CreateAsync` : `room.Price * numberOfNights`). Tant que le tarif tient
+ * dans l'exposant de la devise, les deux coïncident exactement ; au-delà, ils peuvent diverger de
+ * quelques unités mineures — et le voyageur verrait un total annoncé différent du total facturé.
+ *
+ * Cette fonction ne corrige rien : elle rend le cas **détectable** (log) au lieu de silencieux.
+ * La vérification bloquante (comparer le total annoncé au total renvoyé par le PMS à la création)
+ * relève de la story 2.4.
+ */
+export function hasSubMinorPrecision(
+  amount: number,
+  currency: string,
+): boolean {
+  if (!Number.isFinite(amount)) {
+    return false;
+  }
+  const scaled = amount * 10 ** minorUnitExponent(currency);
+  // Tolérance de représentation IEEE-754 : `84.1 * 100 = 8409.999...` n'est pas une vraie
+  // sous-précision. Le seuil reste très inférieur à une unité mineure réellement perdue.
+  return Math.abs(scaled - Math.round(scaled)) > 1e-6;
 }

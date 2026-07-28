@@ -29,6 +29,11 @@ export interface RoomDetailDto {
   hotelName: string | null;
   /** Ville de l'Hôtel (métadonnées SEO). */
   hotelCity: string | null;
+  /**
+   * Logo de l'Hôtel (identification visuelle du récapitulatif de réservation — story 2.2, AC-1).
+   * `null` si l'établissement n'en publie pas : le front retombe alors sur le texte seul.
+   */
+  hotelLogoUrl: string | null;
   number: string | null;
   /** Catégorie/type de chambre (texte libre PMS). */
   category: string | null;

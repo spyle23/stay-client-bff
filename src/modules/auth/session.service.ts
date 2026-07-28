@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { CorrelationService } from '../../common/correlation/correlation.service';
+import type { ApiResponse } from '../../integration/pms/api-response.types';
 import type { PmsRequestContext } from '../../integration/pms/pms-client.service';
 import { PmsClientService } from '../../integration/pms/pms-client.service';
 import { PmsRequestError } from '../../integration/pms/pms-errors';
@@ -19,6 +20,7 @@ import {
   REFRESH_LOCK_PREFIX,
   SESSION_KEY_PREFIX,
 } from './auth.constants';
+import { generateGuestPassword } from './guest-password';
 import { generateSessionId } from './session-cookie';
 
 /**
@@ -39,9 +41,72 @@ import { generateSessionId } from './session-cookie';
 /** Endpoints d'auth du PMS (`Stay-api`). ⚠️ Le refresh est `refresh-token`, pas `refresh`. */
 export const PMS_AUTH_ENDPOINTS = {
   login: '/auth/login',
+  registerCustomer: '/auth/register/customer',
   refreshToken: '/auth/refresh-token',
   logout: '/auth/logout',
 } as const;
+
+/** Coordonnées collectées au Checkout invité (story 2.3 — FR-8). */
+export interface GuestIdentityInput {
+  email: string;
+  firstName: string;
+  lastName: string;
+  phone: string;
+}
+
+/**
+ * L'email fourni en Checkout invité correspond déjà à un compte PMS.
+ *
+ * Erreur **typée** plutôt qu'un test de message dans le contrôleur : le PMS n'expose aucun code
+ * d'erreur distinct (`AuthService.RegisterCustomerAsync` renvoie un simple `Result.Failure`
+ * textuel → 400), la reconnaissance est donc fragile et doit vivre en **un seul endroit**, testé.
+ */
+export class GuestEmailConflictError extends Error {
+  constructor() {
+    super('Un compte existe déjà avec cette adresse email.');
+    this.name = 'GuestEmailConflictError';
+  }
+}
+
+/**
+ * Code machine porté par le corps d'erreur quand le compte PMS a été créé mais que la session
+ * n'a pas pu être ouverte. Le front s'en sert pour ne PAS proposer de réessayer avec la même
+ * adresse — ce rejeu se heurterait au 409 d'un compte que personne ne peut ouvrir.
+ */
+export const GUEST_ACCOUNT_ORPHANED_CODE = 'guest-account-created';
+
+const EMAIL_TAKEN_PATTERN = /email\s+is\s+already\s+registered/i;
+
+/**
+ * Reconnaît le refus d'unicité d'email du PMS (`AuthService.cs:69`).
+ *
+ * ⚠️ Le motif se trouve dans **`errors`**, pas dans `message` : `ApiBadRequest` du PMS sérialise
+ * `{"success":false,"message":null,"errors":["Email is already registered."]}` — vérifié en
+ * conditions réelles. Ne tester que `err.message` reviendrait à lire « Le PMS a renvoyé le statut
+ * 400 » (libellé par défaut du client HTTP) et à ne **jamais** détecter la collision. On balaie
+ * donc les deux, sous les deux formes d'`errors` (tableau ou dictionnaire par champ).
+ *
+ * Tout autre 400 est une **validation refusée** (nom vide, email malformé, mot de passe hors
+ * politique) : le confondre avec une collision enverrait le voyageur se connecter à un compte
+ * qui n'existe pas.
+ */
+function isEmailAlreadyRegistered(err: unknown): boolean {
+  if (!(err instanceof PmsRequestError) || err.status !== 400) {
+    return false;
+  }
+  const messages = [err.message, ...flattenPmsErrors(err.errors)];
+  return messages.some((text) => EMAIL_TAKEN_PATTERN.test(text));
+}
+
+/** Aplatit `errors` du PMS, qu'il soit un tableau de messages ou un dictionnaire par champ. */
+function flattenPmsErrors(
+  errors: Record<string, string[]> | string[] | undefined,
+): string[] {
+  if (!errors) {
+    return [];
+  }
+  return Array.isArray(errors) ? errors : Object.values(errors).flat();
+}
 
 /**
  * Réponse d'auth du PMS (`AuthResponseDto`) — champs **à plat** (pas d'objet `user` imbriqué,
@@ -126,6 +191,120 @@ export class SessionService {
       );
     }
 
+    return this.openSession(record);
+  }
+
+  /**
+   * **Checkout invité** (story 2.3 — FR-8) : provisionne un `Customer` léger côté PMS puis ouvre
+   * la session, exactement comme une connexion.
+   *
+   * Pourquoi un vrai compte : réserver exige le rôle `Customer`
+   * (`RoomReservationsController.CreateReservation`) — le PMS n'a pas de checkout anonyme
+   * (dépendance D5). Le mot de passe est tiré au hasard et **immédiatement oublié**
+   * (cf. `guest-password.ts`).
+   *
+   * ⚠️ `maxRetries: 0` : `register/customer` n'est pas idempotent côté PMS. Rejouer un appel dont
+   * la réponse s'est perdue ferait échouer la 2ᵉ tentative en « email déjà pris » — le voyageur
+   * se verrait alors refuser un compte qui vient d'être créé pour lui et dont personne ne détient
+   * le mot de passe. Un 503 rejouable vaut mieux que cette impasse.
+   */
+  async provisionGuest(
+    guest: GuestIdentityInput,
+  ): Promise<{ sid: string; ttlSeconds: number; user: SessionUser }> {
+    const password = generateGuestPassword();
+
+    let res: ApiResponse<PmsAuthResponse>;
+    try {
+      res = await this.pms.post<PmsAuthResponse>(
+        PMS_AUTH_ENDPOINTS.registerCustomer,
+        {
+          firstName: guest.firstName,
+          lastName: guest.lastName,
+          email: guest.email,
+          password,
+          // Exigé par le validateur PMS (`NotEmpty` + `Equal(Password)`).
+          confirmPassword: password,
+          phone: guest.phone,
+        },
+        { ...this.pmsContext(), maxRetries: 0 },
+      );
+    } catch (err) {
+      if (isEmailAlreadyRegistered(err)) {
+        throw new GuestEmailConflictError();
+      }
+      throw err;
+    }
+
+    // ⚠️ FRONTIÈRE : à partir d'ici le compte EXISTE côté PMS. Tout échec ultérieur laisse un
+    // compte que personne ne peut ouvrir (mot de passe oublié par construction) et qui rendra
+    // 409 à toute nouvelle tentative sur la même adresse. Ces échecs ne doivent donc pas être
+    // présentés comme des pannes ordinaires « réessayez » — le rejeu est précisément l'impasse.
+    let record: SessionRecord;
+    try {
+      record = this.toSessionRecord(res.data);
+    } catch (err) {
+      throw this.guestAccountOrphaned(guest.email, res.data?.userId, err);
+    }
+
+    if (record.role !== CUSTOMER_ROLE) {
+      // Défense en profondeur : `register/customer` ne peut créer qu'un `Customer`, mais une
+      // session ouverte sur un autre rôle depuis l'app cliente ne doit jamais exister. Le compte
+      // est néanmoins créé : on trace l'orphelin, tout en gardant le 403 (plus informatif ici).
+      this.logOrphanedGuestAccount(
+        guest.email,
+        record.userId,
+        'rôle inattendu',
+      );
+      throw new ForbiddenException(
+        "Ce compte n'est pas un compte voyageur. Utilisez l'espace professionnel.",
+      );
+    }
+
+    try {
+      return await this.openSession(record);
+    } catch (err) {
+      throw this.guestAccountOrphaned(guest.email, record.userId, err);
+    }
+  }
+
+  /**
+   * Échec survenu **après** la création du compte PMS : le compte existe, la session non.
+   *
+   * Distingué d'une panne ordinaire par le code `guest-account-created`, pour que le front
+   * n'invite pas à réessayer avec la même adresse (le rejeu donnerait un 409 sur un compte
+   * inouvrable). L'alerte serveur porte de quoi rattraper l'orphelin — jamais de jeton.
+   */
+  private guestAccountOrphaned(
+    email: string,
+    userId: string | null | undefined,
+    cause: unknown,
+  ): ServiceUnavailableException {
+    this.logOrphanedGuestAccount(
+      email,
+      userId,
+      cause instanceof Error ? cause.message : 'cause inconnue',
+    );
+    return new ServiceUnavailableException({
+      message:
+        "Votre compte a bien été créé, mais nous n'avons pas pu ouvrir votre session.",
+      errors: { reason: [GUEST_ACCOUNT_ORPHANED_CODE] },
+    });
+  }
+
+  private logOrphanedGuestAccount(
+    email: string,
+    userId: string | null | undefined,
+    reason: string,
+  ): void {
+    this.logger.error(
+      `Compte invité orphelin — créé côté PMS sans session ouverte. email=${email} userId=${userId ?? 'inconnu'} cause=${reason}`,
+    );
+  }
+
+  /** Ouvre une session serveur pour un enregistrement déjà validé (login et invité partagés). */
+  private async openSession(
+    record: SessionRecord,
+  ): Promise<{ sid: string; ttlSeconds: number; user: SessionUser }> {
     const sid = generateSessionId();
     const ttlSeconds = this.sessionTtlSeconds(record);
     await this.write(sid, record, ttlSeconds);
