@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_PIPE } from '@nestjs/core';
+import { ScheduleModule } from '@nestjs/schedule';
 import { LoggerModule } from 'nestjs-pino';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
@@ -40,6 +41,10 @@ import { HealthModule } from './modules/health/health.module';
       ignoreEnvFile: process.env.NODE_ENV === 'test',
     }),
     LoggerModule.forRoot({ pinoHttp: pinoHttpOptions }),
+    // Planificateur (story 2.4) : le balayeur de holds de checkout y enregistre son intervalle.
+    // Le PMS n'ayant aucun job d'expiration des `Pending`, c'est le BFF qui libère l'inventaire
+    // (repli documenté de la dépendance D3).
+    ScheduleModule.forRoot(),
     CorrelationModule,
     RedisModule,
     PmsModule,

@@ -1,12 +1,25 @@
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import helmet from 'helmet';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { correlationMiddleware } from './common/correlation/correlation.middleware';
+import { resolveTrustProxy } from './common/throttler/throttler.constants';
 
 async function bootstrap() {
   // bufferLogs : les logs de boot sont mis en tampon puis rejoués par pino une fois prêt.
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bufferLogs: true,
+  });
+  // `trust proxy` (story 2.4) : commande la valeur de `req.ip`, sur laquelle repose la limitation
+  // de débit par adresse (NFR-7). Défaut `false` — voir `resolveTrustProxy` : les deux erreurs
+  // possibles (activé sans proxy / désactivé derrière un proxy) sont graves et opposées, il n'y a
+  // donc pas de valeur universellement sûre. À poser explicitement au déploiement.
+  //
+  // Deux garde-fous au boot, ici et pas plus tard : une valeur invalide **arrête** le démarrage en
+  // nommant `TRUST_PROXY` (sinon `proxy-addr` lève un `TypeError: invalid IP address` anonyme à la
+  // première requête), et une variable absente en production produit un log `error` explicite.
+  app.set('trust proxy', resolveTrustProxy());
   // Corrélation-id EN PREMIER — englobe la journalisation pino et tous les handlers.
   app.use(correlationMiddleware);
   // Journalisation via pino (logs Nest routés vers pino : JSON structuré + redaction).

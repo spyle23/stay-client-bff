@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { SessionGuard } from '../../common/guards/session.guard';
+import { AppThrottlerModule } from '../../common/throttler/throttler.module';
 import { PmsModule } from '../../integration/pms/pms.module';
 import { AUTH_OPTIONS, resolveAuthOptions } from './auth.constants';
 import { AuthController } from './auth.controller';
@@ -19,7 +20,9 @@ import { SessionService } from './session.service';
  * un jeton eux-mêmes.
  */
 @Module({
-  imports: [PmsModule],
+  // `AppThrottlerModule` (story 2.4) fournit `ThrottlerGuard` : seule `POST /auth/guest` s'en sert,
+  // le guard n'étant volontairement pas global (cf. `throttler.module.ts`).
+  imports: [PmsModule, AppThrottlerModule],
   controllers: [AuthController],
   providers: [
     { provide: AUTH_OPTIONS, useFactory: () => resolveAuthOptions() },

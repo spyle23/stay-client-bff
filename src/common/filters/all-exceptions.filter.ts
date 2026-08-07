@@ -6,11 +6,13 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
+import { ThrottlerException } from '@nestjs/throttler';
 import type { Response } from 'express';
 import {
   PmsRequestError,
   PmsUnavailableError,
 } from '../../integration/pms/pms-errors';
+import { RATE_LIMITED_REASON } from '../throttler/throttler.constants';
 
 /**
  * Filtre d'exceptions **global** du BFF (story 1.6). Normalise toute exception en une
@@ -20,6 +22,7 @@ import {
  * Mapping :
  * - `PmsUnavailableError` → **503** (dégradation gracieuse — jamais un faux « 0 résultat », NFR-10) ;
  * - `PmsRequestError`     → statut d'origine (4xx métier) + enveloppe préservée ;
+ * - `ThrottlerException`  → **429** + motif machine `errors.reason = ['rate-limited']` (AC-8) ;
  * - `HttpException`       → statut Nest (dont la validation → 400) ; les charges utiles
  *   structurées de `@nestjs/terminus` (`/health`) sont **laissées intactes** ;
  * - inconnu               → **500** générique (détail loggé, jamais exposé au client).
@@ -67,6 +70,19 @@ export class AllExceptionsFilter implements ExceptionFilter {
         body: errors
           ? { success: false, message: exception.message, errors }
           : { success: false, message: exception.message },
+      };
+    }
+    // Avant le cas général (`ThrottlerException` **est** une `HttpException`) : un 429 doit porter
+    // un motif **machine** en plus du message affichable, comme tous les refus typés du BFF. Le
+    // front s'appuie déjà sur `errors.reason` (`room-unavailable`, `price-changed`…) : sans lui,
+    // il devrait deviner la limitation de débit en analysant du texte français.
+    if (exception instanceof ThrottlerException) {
+      return {
+        status: exception.getStatus(),
+        body: {
+          ...fromHttpException(exception),
+          errors: { reason: [RATE_LIMITED_REASON] },
+        },
       };
     }
     if (exception instanceof HttpException) {

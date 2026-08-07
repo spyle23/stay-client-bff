@@ -11,8 +11,11 @@ import {
   Req,
   Res,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
+import { GUEST_CHECKOUT_THROTTLE } from '../../common/throttler/throttler.constants';
 import type { ApiResponse } from '../../integration/pms/api-response.types';
 import { PmsRequestError } from '../../integration/pms/pms-errors';
 import { AUTH_OPTIONS, type AuthOptions } from './auth.constants';
@@ -48,9 +51,10 @@ import {
  * L'inscription explicite (avec mot de passe choisi) et le mot de passe oublié **ne sont pas ici** :
  * story 4.1. Le lien de gestion signé (FR-18) est du périmètre Epic 4.
  *
- * ⚠️ Aucune de ces routes n'est encore limitée en débit (`@nestjs/throttler` installé, non câblé —
- * story 6.1). `POST /auth/guest` est une écriture publique **créant des comptes PMS** : elle doit
- * rejoindre la même politique que la création de réservation (story 2.4).
+ * ⚠️ Seule `POST /auth/guest` est limitée en débit (story 2.4) : c'est une écriture publique qui
+ * **crée des comptes `Customer` réels** dans le PMS et dont le couple 409/200 forme un oracle
+ * d'énumération d'emails. `login`, `session` et `logout` rejoindront la politique transverse de la
+ * **story 6.1** (avec la défense CSRF et le préfixe `__Host-`).
  */
 
 /** État de session exposé au navigateur — jamais de jeton, jamais de rôle interne. */
@@ -114,9 +118,17 @@ export class AuthController {
    * arrière. Une session portant un **autre** email est détruite après provisioning : deux
    * identités concurrentes dans le même tunnel mèneraient à une réservation rattachée au mauvais
    * compte, et l'ancienne clé Redis survivrait des jours avec ses JWT.
+   *
+   * ⚠️ **Politique de débit explicite** (`GUEST_CHECKOUT_THROTTLE`) plutôt qu'héritée des limiteurs
+   * globaux : seuils **nus** ici, contrairement à la création de réservation. Aucun rejeu gratuit
+   * à absorber — une double soumission sur le **même** email réutilise la session sans appeler le
+   * PMS (AC-10) — et un email **différent** à chaque tentative est exactement le motif à freiner
+   * (le couple 409/200 de cette route forme un oracle d'énumération d'emails).
    */
   @Post('guest')
   @HttpCode(HttpStatus.OK)
+  @UseGuards(ThrottlerGuard)
+  @Throttle(GUEST_CHECKOUT_THROTTLE)
   async guest(
     @Body() body: GuestCheckoutRequestDto,
     @Req() req: Request,

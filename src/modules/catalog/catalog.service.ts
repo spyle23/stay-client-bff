@@ -36,6 +36,8 @@ const CACHE_PREFIX = 'catalog:hotel:v1:';
 const GALLERY_CACHE_PREFIX = 'catalog:gallery:v1:';
 /** Cache de la fiche chambre (story 1.10) — clé par (hôtel, chambre, dates, voyageurs). */
 const ROOM_CACHE_PREFIX = 'catalog:room:v1:';
+/** Cache de la devise d'un hôtel (story 2.4) — indépendante des dates, partagée par toutes les vues. */
+const CURRENCY_CACHE_PREFIX = 'catalog:currency:v1:';
 const MS_PER_DAY = 86_400_000;
 /** Devise par défaut du PMS quand un hôtel n'en porte pas (Stay-api : `Hotel.Currency` défaut EUR). */
 const DEFAULT_CURRENCY = 'EUR';
@@ -110,8 +112,10 @@ export class CatalogService {
     }
 
     // Devise résolue **une seule fois** : l'hôtel et ses chambres portent la MÊME devise (jamais
-    // `null` d'un côté et une devise fabriquée de l'autre).
+    // `null` d'un côté et une devise fabriquée de l'autre). Elle est aussi mémorisée pour
+    // `getHotelCurrency`, source unique de devise du tunnel de réservation.
     const currency = normaliseCurrency(hotel.currency);
+    await this.rememberCurrency(id, currency);
 
     const { rooms, roomsUnavailable } = await this.fetchRooms(
       id,
@@ -175,6 +179,9 @@ export class CatalogService {
     // jusqu'au navigateur — exposant d'unités mineures replié à 2 en silence, et un « Total »
     // affiché sans devise, contraire à AR-12 (« la devise est toujours transportée »).
     const currency = normaliseCurrency(hotel.currency);
+    // Mémorisée pour `getHotelCurrency` : le tunnel de réservation lit alors la devise issue du
+    // MÊME corps que le tarif qu'il vient de composer, sans second aller-retour PMS.
+    await this.rememberCurrency(hotelId, currency);
 
     // La chambre depuis la liste NON datée (présente même quand indisponible). Une chambre absente
     // = 404 ; une panne (non-404) sur cette liste = dégradation de page (rethrow → 503).
@@ -210,6 +217,56 @@ export class CatalogService {
       await this.writeCache(cacheKey, dto);
     }
     return dto;
+  }
+
+  /**
+   * Devise d'un hôtel — lecture minimale, cachée (story 2.4).
+   *
+   * Pourquoi elle existe : `RoomReservationDto` du PMS ne porte **aucune devise** ; ses montants
+   * sont des `decimal` nus. Or convertir en unités mineures exige l'exposant réel de la devise
+   * (MGA/JPY = 0 décimale, EUR/USD = 2, KWD = 3) — un défaut à EUR produirait un montant faux d'un
+   * facteur 10^n, **sans aucun symptôme côté BFF**. La relecture d'une réservation doit donc
+   * résoudre la devise depuis l'hôtel, et non la supposer.
+   *
+   * Propage un 404 (hôtel introuvable) et une panne PMS : sans devise, aucun montant ne peut être
+   * exposé honnêtement (AR-12 : « la devise accompagne toujours le montant »).
+   *
+   * ⚠️ **Le texte du PMS ne sort jamais d'ici** (revue 2.4). Une `PmsRequestError` non capturée
+   * atteignait le filtre global, qui relaie `message` **et** `errors` tels quels : le corps
+   * d'erreur d'un endpoint interne du PMS se retrouvait dans le navigateur d'un voyageur, sur une
+   * simple relecture de réservation. Le **statut** est conservé (l'appelant doit pouvoir
+   * distinguer un 404 d'une panne), le contenu est remplacé par un libellé BFF.
+   */
+  async getHotelCurrency(hotelId: string): Promise<string> {
+    const cached = await this.readCache<string>(this.currencyCacheKey(hotelId));
+    if (cached) {
+      return cached;
+    }
+
+    let res;
+    try {
+      res = await this.pms.get<PmsHotel>(
+        `/Hotels/${hotelId}`,
+        this.pmsContext(),
+      );
+    } catch (err) {
+      if (err instanceof PmsRequestError) {
+        this.logger.warn(
+          `Devise indisponible pour l'hôtel ${hotelId} (statut ${err.status}) : ${err.message}`,
+        );
+        throw new PmsRequestError(
+          'Devise de l’hôtel indisponible.',
+          err.status,
+        );
+      }
+      throw err; // panne (PmsUnavailableError) → 503 par le filtre global
+    }
+    if (!res.data || !res.data.id) {
+      throw new PmsRequestError('Hôtel introuvable.', 404);
+    }
+    const currency = normaliseCurrency(res.data.currency);
+    await this.rememberCurrency(hotelId, currency);
+    return currency;
   }
 
   /**
@@ -711,6 +768,30 @@ export class CatalogService {
 
   private galleryCacheKey(id: string): string {
     return GALLERY_CACHE_PREFIX + createHash('sha1').update(id).digest('hex');
+  }
+
+  private currencyCacheKey(hotelId: string): string {
+    return (
+      CURRENCY_CACHE_PREFIX + createHash('sha1').update(hotelId).digest('hex')
+    );
+  }
+
+  /**
+   * Mémorise la devise **dès qu'un payload hôtel est lu**, quelle que soit la vue qui l'a lu.
+   *
+   * Le module `booking` résout toute devise via `getHotelCurrency` (source unique du tunnel). Sans
+   * ce partage, un pré-contrôle de création lisait `/Hotels/{id}` pour composer la fiche chambre,
+   * puis `getHotelCurrency` le relisait aussitôt : un aller-retour PMS de plus **et** deux entrées
+   * de cache écrites à des instants différents, donc susceptibles de diverger. Ici les deux vues
+   * dérivent du **même** corps.
+   */
+  private async rememberCurrency(
+    hotelId: string,
+    currency: string,
+  ): Promise<void> {
+    if (hotelId.length > 0) {
+      await this.writeCache(this.currencyCacheKey(hotelId), currency);
+    }
   }
 
   private async readCache<T>(key: string): Promise<T | null> {
