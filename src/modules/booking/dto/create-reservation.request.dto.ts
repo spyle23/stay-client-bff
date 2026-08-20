@@ -1,5 +1,7 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  IsArray,
   IsIn,
   IsInt,
   IsOptional,
@@ -9,6 +11,7 @@ import {
   Max,
   MaxLength,
   Min,
+  ValidateNested,
 } from 'class-validator';
 import {
   IsAfterDateProperty,
@@ -21,6 +24,10 @@ import {
   SPECIAL_REQUESTS_MAX_LENGTH,
   type CommunicationLocale,
 } from '../special-requests';
+import {
+  ReservationServiceLineRequestDto,
+  UPSELL_BASKET_MAX_LINES,
+} from './upsell-service.dto';
 
 /**
  * Corps de création d'une Réservation `Pending` (story 2.4, FR-9 ; story 2.5, FR-10).
@@ -121,4 +128,22 @@ export class CreateReservationRequestDto {
     message: `La langue de communication doit être l'une de : ${COMMUNICATION_LOCALES.join(', ')}.`,
   })
   communicationLocale?: CommunicationLocale;
+
+  /**
+   * Panier de services ajoutés au moment de la réservation — facultatif (story 2.6, FR-11).
+   *
+   * ⚠️ **Absent ou vide, la clé est OMISE du corps PMS** (jamais envoyée à `[]`) : une réservation
+   * sans upsell doit produire exactement la même requête qu'avant D6.
+   *
+   * Les prix ne transitent pas : ils sont relus du catalogue par le BFF (contrôle du total annoncé)
+   * puis par le PMS (montant persisté).
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(UPSELL_BASKET_MAX_LINES, {
+    message: `Le panier ne peut pas dépasser ${UPSELL_BASKET_MAX_LINES} lignes.`,
+  })
+  @ValidateNested({ each: true })
+  @Type(() => ReservationServiceLineRequestDto)
+  services?: ReservationServiceLineRequestDto[];
 }

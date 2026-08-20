@@ -19,6 +19,7 @@ import { SessionService } from '../auth/session.service';
 import {
   classifyReservationFailure,
   isPmsGuid,
+  assertPmsGuid,
   PMS_RESERVATION_ENDPOINTS,
   toBookingException,
 } from './booking-errors';
@@ -38,8 +39,26 @@ import type {
   ReservationStatusName,
 } from './dto/reservation.dto';
 import type { CommunicationLocale } from './special-requests';
+import type {
+  ReplaceReservationServicesRequestDto,
+  ReservationServiceLineRequestDto,
+  UpsellCatalogDto,
+} from './dto/upsell-service.dto';
+import type { UpsellQueryDto } from './dto/upsell.query.dto';
 
 type PmsReservation = components['schemas']['RoomReservationDto'];
+
+type PmsHotelService = components['schemas']['HotelServiceDto'];
+
+/**
+ * Chemin PMS du catalogue de services d'un hôtel. `[RequireRole(Manager, Customer)]` : le JWT
+ * `Customer` en custody suffit — la dépendance D9 (lecture anonyme) ne concerne que la page
+ * publique, pas le tunnel.
+ */
+const PMS_SERVICE_ENDPOINTS = {
+  byHotel: (hotelId: string) =>
+    `/hotels/${assertPmsGuid(hotelId, 'hotelId')}/services`,
+} as const;
 
 /** `PaymentMethod.Stripe` côté PMS (Cash=1, CreditCard=2, BankTransfer=3, Stripe=4, MobileMoney=5). */
 const PAYMENT_METHOD_STRIPE = 4;
@@ -314,7 +333,16 @@ export class BookingService {
     const room = await this.fetchRoomForPrecheck(dto);
     // Source **unique** de devise pour toute la réservation : création, rejeu et relecture.
     const currency = await this.hotelCurrency(dto.hotelId);
-    this.assertBookable(dto, room, currency);
+    // Story 2.6 : le panier est tarife AU CATALOGUE SERVEUR avant tout controle. Un prix venu du
+    // client permettrait de reserver un service a 0 ; et sans ce montant, `expectedTotal` ne
+    // pourrait pas etre confronte au total reellement du (AC-3).
+    const servicesTotal = await this.priceBasket(
+      session,
+      dto.hotelId,
+      currency,
+      dto.services ?? [],
+    );
+    this.assertBookable(dto, room, currency, servicesTotal);
 
     // Intention enregistrée AVANT l'appel : à partir d'ici, même une réponse perdue laisse une
     // trace que le balayeur saura réconcilier (correctif D1).
@@ -450,6 +478,7 @@ export class BookingService {
     dto: CreateReservationRequestDto,
     room: RoomDetailDto,
     currency: string,
+    servicesTotal: number,
   ): void {
     if (room.capacity !== null && dto.guests > room.capacity) {
       throw toBookingException('over-capacity');
@@ -476,12 +505,14 @@ export class BookingService {
     if (currency !== dto.expectedCurrency) {
       // L'écran affichait une autre monnaie que celle qui sera débitée : refuser avant d'écrire.
       throw toBookingException('price-changed', {
-        total: room.pricePerNight * room.nights,
+        total: room.pricePerNight * room.nights + servicesTotal,
         currency,
       });
     }
 
-    const announced = room.pricePerNight * room.nights;
+    // Story 2.6 / AC-3 : le total annonce couvre chambre ET services. Comparer `expectedTotal`
+    // au seul total chambre ferait echouer en `price-changed` toute reservation avec upsell.
+    const announced = room.pricePerNight * room.nights + servicesTotal;
     if (announced <= 0) {
       // Un total nul ou négatif n'est pas un tarif : le laisser passer produirait une réservation
       // à prix zéro que le parcours de re-confirmation accepterait ensuite en 201.
@@ -741,6 +772,16 @@ export class BookingService {
       throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
     }
 
+    // Story 2.6 / D6 : le montant qui engage est le GRAND total (chambre + services), pas
+    // `totalPrice` qui reste volontairement la chambre seule côté PMS. `grandTotal` est absent des
+    // réponses antérieures à D6 : on retombe alors sur `totalPrice`, ce qui décrit exactement la
+    // même somme quand il n'y a aucun service.
+    const grandTotal =
+      typeof reservation.grandTotal === 'number' &&
+      Number.isFinite(reservation.grandTotal)
+        ? reservation.grandTotal
+        : totalPrice;
+
     return {
       reservationId: reservation.id ?? '',
       reservationCode: reservation.reservationCode ?? '',
@@ -762,7 +803,19 @@ export class BookingService {
       // La devise ne vient PAS du DTO du PMS (il n'en porte aucune) : elle est résolue depuis
       // l'Hôtel, et son exposant commande la conversion (MGA ×1, EUR ×100, KWD ×1000).
       pricePerNight: toMinorUnits(reservation.pricePerNight ?? 0, currency),
-      total: toMinorUnits(totalPrice, currency),
+      roomTotal: toMinorUnits(totalPrice, currency),
+      servicesTotal: toMinorUnits(reservation.servicesTotal ?? 0, currency),
+      total: toMinorUnits(grandTotal, currency),
+      services: (reservation.services ?? []).map((line) => ({
+        lineId: line.id ?? '',
+        serviceId: line.serviceId ?? '',
+        name: line.serviceName ?? '',
+        unitPrice: toMinorUnits(line.price ?? 0, currency),
+        quantity: line.quantity ?? 0,
+        lineTotal: toMinorUnits(line.totalPrice ?? 0, currency),
+        serviceDate: dateOnly(line.serviceDate),
+        status: statusNameOf(line.status),
+      })),
 
       holdExpiresAt: extras.holdExpiresAt,
 
@@ -778,6 +831,191 @@ export class BookingService {
 
       created: extras.created,
     };
+  }
+
+  // --- Upsell de services (story 2.6, FR-11 / dépendance D6) --------------------------------
+
+  /**
+   * Catalogue des services proposables pour un séjour (story 2.6, AC-1/AC-2).
+   *
+   * Lu avec le **JWT `Customer`** en custody : `GET /hotels/{id}/services` est
+   * `[RequireRole(Manager, Customer)]` côté PMS — la dépendance **D9** (lecture anonyme) n'est
+   * donc pas nécessaire tant que l'upsell reste dans le tunnel. Elle le redeviendra pour la page
+   * hôtel publique (SEO), pas ici.
+   *
+   * Deux filtrages, dans cet ordre :
+   * 1. le catalogue lui-même (`isActive`, `isExternallyBookable`, prix vendable) ;
+   * 2. **les services déjà compris dans la chambre** — proposer d'acheter ce qui est inclus dans
+   *    le tarif est une rupture de confiance directe (UX-DR-9.2).
+   *
+   * Une panne PMS ne ferme jamais le tunnel : catalogue vide + `degraded: true`, et le front tait
+   * la section au lieu d'affirmer « aucun service » (règle héritée de 1.10). **Une fiche chambre
+   * indisponible dégrade aussi** : sans elle on ignore ce qui est inclus, et vendre par défaut
+   * serait le pire des deux choix.
+   */
+  async getUpsellServices(
+    session: RequestSession,
+    query: UpsellQueryDto,
+  ): Promise<UpsellCatalogDto> {
+    let includedNames: ReadonlySet<string>;
+    try {
+      const room = await this.catalog.getRoomDetail(
+        query.hotelId,
+        query.roomId,
+        {
+          checkInDate: query.checkInDate,
+          checkOutDate: query.checkOutDate,
+          guests: query.guests,
+        },
+      );
+      includedNames = new Set(
+        room.includedServices.map((s) => normalizeServiceName(s.name)),
+      );
+    } catch {
+      this.logger.warn(
+        `Fiche chambre indisponible (hôtel ${query.hotelId}, chambre ${query.roomId}) : ` +
+          `impossible de savoir ce qui est déjà inclus — upsell masqué plutôt que vendu à tort.`,
+      );
+      return { services: [], degraded: true };
+    }
+
+    const currency = await this.hotelCurrency(query.hotelId);
+
+    let raw: PmsHotelService[];
+    try {
+      const res = await this.sessions.withCustomerAuth(session.sid, (token) =>
+        this.pms.get<PmsHotelService[]>(
+          PMS_SERVICE_ENDPOINTS.byHotel(query.hotelId),
+          { ...this.pmsContext(), bearerToken: token },
+        ),
+      );
+      raw = Array.isArray(res.data) ? res.data : [];
+    } catch (err) {
+      this.logger.warn(
+        `Catalogue de services indisponible pour l'hôtel ${query.hotelId} : ` +
+          `${err instanceof Error ? err.message : 'cause inconnue'} — section upsell masquée.`,
+      );
+      return { services: [], degraded: true };
+    }
+
+    const services = raw
+      .filter(isSellableService)
+      // AC-2 : ce qui est déjà compris dans la chambre n'est jamais remis en vente.
+      .filter((s) => !includedNames.has(normalizeServiceName(s.name as string)))
+      .map((s) => ({
+        serviceId: s.id as string,
+        name: (s.name as string).trim(),
+        description: s.description ?? null,
+        unitPrice: toMinorUnits(s.price as number, currency),
+        currency,
+        unit: s.unit ?? null,
+      }));
+
+    return { services, degraded: false };
+  }
+
+  /**
+   * Remplace le panier d'une Réservation `Pending` (story 2.6, AC-5).
+   *
+   * Le PMS tranche : propriété, statut `Pending`, disponibilité, et surtout le **gel du panier**
+   * dès qu'un paiement est engagé. Le BFF ne duplique aucune de ces règles — il traduit le refus
+   * en motif métier lisible plutôt qu'en 503 générique.
+   *
+   * La réservation est **relue** ensuite : le total qui fait foi est celui que le PMS a persisté,
+   * jamais celui que le BFF pourrait recalculer.
+   */
+  async replaceServices(
+    session: RequestSession,
+    reservationId: string,
+    dto: ReplaceReservationServicesRequestDto,
+  ): Promise<BookingReservationDto> {
+    try {
+      await this.sessions.withCustomerAuth(session.sid, (token) =>
+        this.pms.put<unknown>(
+          PMS_RESERVATION_ENDPOINTS.services(reservationId),
+          { services: dto.services.map(toPmsServiceLine) },
+          {
+            ...this.pmsContext(),
+            bearerToken: token,
+            // Écriture idempotente : rejouer le MÊME panier ne doit pas produire d'effet
+            // supplémentaire (la sémantique replace du PMS le garantit déjà, la clé l'affirme).
+            idempotencyKey: `services:${reservationId}:${basketFingerprint(dto.services)}`,
+          },
+        ),
+      );
+    } catch (err) {
+      const reason = classifyReservationFailure(err);
+      if (reason === null) {
+        throw err; // panne → 503 par le filtre global
+      }
+      throw toBookingException(reason);
+    }
+
+    return this.getReservation(session, reservationId);
+  }
+
+  /**
+   * Somme du panier, **au prix du catalogue serveur** (unités mineures).
+   *
+   * C'est ce montant — et non celui annoncé par le client — qui entre dans le contrôle du total
+   * (AC-3). Sans lui, ajouter un service ferait diverger `expectedTotal` du total chambre et
+   * déclencherait une fausse alerte `price-changed` à chaque sélection.
+   *
+   * Un service introuvable, inactif ou non vendable fait **échouer la demande** : à la création il
+   * n'y a encore aucun engagement, mieux vaut refuser tôt avec un motif clair. La règle inverse —
+   * retrait silencieux — ne vaut qu'à la confirmation, où la chambre est déjà engagée (AC-6).
+   */
+  private async priceBasket(
+    session: RequestSession,
+    hotelId: string,
+    currency: string,
+    lines: readonly ReservationServiceLineRequestDto[],
+  ): Promise<number> {
+    if (lines.length === 0) {
+      return 0;
+    }
+
+    let raw: PmsHotelService[];
+    try {
+      const res = await this.sessions.withCustomerAuth(session.sid, (token) =>
+        this.pms.get<PmsHotelService[]>(
+          PMS_SERVICE_ENDPOINTS.byHotel(hotelId),
+          {
+            ...this.pmsContext(),
+            bearerToken: token,
+          },
+        ),
+      );
+      raw = Array.isArray(res.data) ? res.data : [];
+    } catch {
+      // Le catalogue est indispensable pour annoncer un total honnête : sans lui on ne peut ni
+      // confirmer ni infirmer le montant affiché. Panne → 503, jamais un total deviné.
+      throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
+    }
+
+    const byId = new Map<string, PmsHotelService>(
+      raw.filter((s) => isPmsGuid(s.id)).map((s) => [s.id as string, s]),
+    );
+
+    let total = 0;
+    for (const line of lines) {
+      const service = byId.get(line.serviceId);
+      if (service === undefined || !isSellableService(service)) {
+        throw toBookingException('service-unavailable');
+      }
+      total += toMinorUnits(service.price as number, currency) * line.quantity;
+    }
+
+    if (!Number.isSafeInteger(total)) {
+      // Au-delà des entiers sûrs, l'arithmétique de totaux perd de la précision en silence —
+      // dette déjà relevée sur le total chambre (revue 2.2), aggravée par l'addition de lignes.
+      this.logger.error(
+        `Total de services hors des entiers sûrs pour l'hôtel ${hotelId} (${total}).`,
+      );
+      throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
+    }
+
+    return total;
   }
 
   // --- Interne : garde-fous partagés -------------------------------------------------------
@@ -913,6 +1151,12 @@ function buildPmsCreateBody(
     body.specialRequests = dto.specialRequests;
   }
 
+  // Story 2.6 / D6 — panier d'upsell. La clé est OMISE quand le panier est vide : une réservation
+  // sans service doit produire exactement la même requête qu'avant D6 (AC-9). Les prix ne partent
+  // pas : le PMS les relit de son propre catalogue.
+  if (dto.services !== undefined && dto.services.length > 0) {
+    body.services = dto.services.map(toPmsServiceLine);
+  }
   return body;
 }
 
@@ -933,6 +1177,74 @@ function dateOnly(value: string | null | undefined): string {
  */
 function statusNameOf(status: number | undefined): ReservationStatusName {
   return status !== undefined ? (STATUS_NAMES[status] ?? 'Unknown') : 'Unknown';
+}
+
+/**
+ * Vrai si le service est réellement vendable au voyageur : actif, ouvert à la réservation externe,
+ * nommé, et porteur d'un prix strictement positif. Un prix nul ou absent n'est pas « gratuit » —
+ * c'est une donnée incomplète, et la vendre produirait une ligne de panier à 0.
+ */
+function isSellableService(service: PmsHotelService): boolean {
+  return (
+    isPmsGuid(service.id) &&
+    service.isActive !== false &&
+    service.isExternallyBookable !== false &&
+    // ⚠️ `externalQuantity === 0` signifie **illimité** côté PMS, pas « épuisé » — sémantique
+    // contre-intuitive mais en place (`ServiceAvailabilityChecker`). Un stock FINI (> 0) impose
+    // un créneau horaire (`StartTime`/`EndTime`) que ce tunnel ne collecte pas : le PMS refuserait
+    // la création avec « Start time and end time are required ». Le proposer serait donc promettre
+    // un ajout impossible. Les services à créneau relèvent d'un sélecteur daté, hors périmètre de
+    // la story 2.6. Trouvé en préparation de Phase 3, sur le seul service vendable du seed.
+    (service.externalQuantity ?? 0) === 0 &&
+    typeof service.price === 'number' &&
+    Number.isFinite(service.price) &&
+    service.price > 0 &&
+    typeof service.name === 'string' &&
+    service.name.trim().length > 0
+  );
+}
+
+/**
+ * Clé de rapprochement d'un service inclus avec un service du catalogue.
+ *
+ * ⚠️ **Pis-aller assumé.** La composition `catalog.mapIncludedServices` n'expose que `serviceName` :
+ * le DTO PMS des services inclus ne porte pas l'identifiant du service. Un renommage côté hôtelier
+ * ferait donc réapparaître à la vente un service pourtant compris dans le tarif. Correctif durable
+ * = exposer `serviceId` sur les services inclus (candidat dépendance PMS, consigné).
+ */
+function normalizeServiceName(name: string): string {
+  return name
+    .trim()
+    .toLocaleLowerCase('fr-FR')
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/\s+/g, ' ');
+}
+
+/** Ligne de panier au format attendu par le PMS (date ancrée UTC). */
+function toPmsServiceLine(
+  line: ReservationServiceLineRequestDto,
+): Record<string, unknown> {
+  return {
+    serviceId: line.serviceId,
+    quantity: line.quantity,
+    // Une date-only arriverait en `Kind=Unspecified` et Npgsql rejetterait l'écriture sur une
+    // colonne `timestamptz` (500). Même piège que les dates de séjour.
+    serviceDate: toPmsUtcDateTime(line.serviceDate),
+  };
+}
+
+/**
+ * Empreinte stable d'un panier, pour la clé d'idempotence. Triée : deux envois des mêmes lignes
+ * dans un ordre différent décrivent le même panier et ne doivent pas produire deux clés.
+ */
+function basketFingerprint(
+  lines: readonly ReservationServiceLineRequestDto[],
+): string {
+  return lines
+    .map((l) => `${l.serviceId}x${l.quantity}@${l.serviceDate}`)
+    .sort()
+    .join('|');
 }
 
 function delay(ms: number): Promise<void> {

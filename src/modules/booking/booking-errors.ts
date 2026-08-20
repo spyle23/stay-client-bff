@@ -67,6 +67,12 @@ export const PMS_RESERVATION_ENDPOINTS = {
   cancel: (reservationId: string) =>
     `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/cancel`,
   /**
+   * Remplace le panier de services d'une Réservation `Pending` (story 2.6 / dépendance D6).
+   * Sémantique REPLACE : les lignes envoyées deviennent le panier complet.
+   */
+  services: (reservationId: string) =>
+    `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/services`,
+  /**
    * Réservations du **compte courant** (`[RequireRole(Customer)]`, réponse paginée). Seul moyen,
    * pour le balayeur, de retrouver une `Pending` dont l'identifiant s'est perdu avec la réponse de
    * création (réconciliation des intentions — correctif D1).
@@ -95,6 +101,8 @@ export type BookingFailureReason =
   | 'room-not-found'
   | 'session-invalid'
   | 'price-changed'
+  | 'service-unavailable'
+  | 'services-locked'
   | 'rejected';
 
 /** Clé du dictionnaire d'erreurs portant le motif machine (`errors.reason`). */
@@ -108,6 +116,19 @@ export const BOOKING_REASON_KEY = 'reason';
 const PMS_FAILURE_PATTERNS: ReadonlyArray<
   readonly [RegExp, BookingFailureReason]
 > = [
+  // Story 2.6 / D6 - panier de services. AVANT les motifs chambre : le PMS emploie la meme
+  // formule « does not belong to this hotel » pour un service, qui serait sinon classe
+  // « chambre introuvable » et enverrait le voyageur corriger son sejour.
+  [/service\s+does\s+not\s+belong\s+to\s+this\s+hotel/i, 'service-unavailable'],
+  [/cannot\s+modify\s+services/i, 'services-locked'],
+  [/payment\s+is\s+already\s+engaged/i, 'services-locked'],
+  [/hotel\s+service\s+not\s+found/i, 'service-unavailable'],
+  [/hotel\s+service\s+is\s+not\s+active/i, 'service-unavailable'],
+  [/not\s+available\s+for\s+external\s+booking/i, 'service-unavailable'],
+  [/service\s+date\s+must\s+fall\s+within/i, 'service-unavailable'],
+  [/no\s+availability\s+for\s+this\s+time\s+slot/i, 'service-unavailable'],
+  [/service\s+quantity\s+must\s+be/i, 'service-unavailable'],
+  [/only\s+\d+\s+unit\(s\)\s+available/i, 'service-unavailable'],
   [/exceeds\s+room\s+capacity/i, 'over-capacity'],
   [/room\s+not\s+found/i, 'room-not-found'],
   [/does\s+not\s+belong\s+to\s+this\s+hotel/i, 'room-not-found'],
@@ -126,6 +147,10 @@ const REASON_MESSAGES: Record<BookingFailureReason, string> = {
   'room-not-found': 'Chambre introuvable.',
   'session-invalid': 'Session expirée. Identifiez-vous à nouveau.',
   'price-changed': 'Le tarif de cette chambre a changé.',
+  'service-unavailable':
+    "Ce service n'est plus disponible pour votre séjour. Retirez-le pour continuer.",
+  'services-locked':
+    'Votre paiement est engagé : le panier de services ne peut plus être modifié.',
   rejected:
     "Votre demande n'a pas été acceptée. Vérifiez les informations de votre séjour.",
 };
@@ -219,9 +244,15 @@ export function toBookingException(
   const body = { message: REASON_MESSAGES[reason], errors };
 
   switch (reason) {
+    // Conflits d'état : la demande est cohérente, c'est le monde qui a changé. Story 2.6 ajoute
+    // le service devenu indisponible et le panier gelé par un paiement engagé — tous deux se
+    // corrigent par une action sur l'écran courant, là où un 400 dirait à tort au voyageur de
+    // revoir les informations de son séjour.
     case 'room-unavailable':
     case 'over-capacity':
     case 'price-changed':
+    case 'service-unavailable':
+    case 'services-locked':
       return new ConflictException(body);
     case 'room-not-found':
       return new NotFoundException(body);

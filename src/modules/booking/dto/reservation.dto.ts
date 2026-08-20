@@ -51,6 +51,21 @@ export interface BookingReservationDto {
   total: number;
 
   /**
+   * Sous-total **chambre seule** en unités mineures (story 2.6 / D6). C'est le `totalPrice` du PMS,
+   * dont la sémantique n'a pas changé : il alimente encore l'e-mail, le PDF et les KPI hôtel.
+   */
+  roomTotal: number;
+
+  /** Sous-total des services non annulés, en unités mineures. `0` sans upsell. */
+  servicesTotal: number;
+
+  /**
+   * Services réellement attachés à la Réservation, relus du PMS — jamais l'écho du panier envoyé.
+   * Sur un rejeu, ce sont ceux de la première soumission qui font foi.
+   */
+  services: ReservationServiceDto[];
+
+  /**
    * Échéance du Hold de checkout (ISO 8601 UTC), ou `null` si le hold a expiré / n'existe plus.
    * Information **factuelle** destinée à l'écran — jamais un levier d'urgence (UX-DR-9.5).
    */
@@ -86,4 +101,23 @@ export interface BookingReservationDto {
 
   /** `true` si cet appel a réellement créé la réservation ; `false` sur rejeu idempotent. */
   created: boolean;
+}
+
+/**
+ * Une ligne de service attachée à une Réservation (story 2.6, FR-11), telle que relue du PMS.
+ */
+export interface ReservationServiceDto {
+  /** Identifiant de la LIGNE côté PMS. Non stable entre deux éditions du panier (replace). */
+  lineId: string;
+  serviceId: string;
+  name: string;
+  /** Prix unitaire capté au catalogue lors de la réservation, en unités mineures. */
+  unitPrice: number;
+  quantity: number;
+  /** Total de la ligne, en unités mineures. */
+  lineTotal: number;
+  /** Date de consommation, `AAAA-MM-JJ`. */
+  serviceDate: string;
+  /** `pending` tant que la Réservation ne l'est pas ; `cancelled` si le service a été retiré. */
+  status: ReservationStatusName;
 }

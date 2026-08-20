@@ -4700,7 +4700,7 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ConfirmationResultDtoApiResponse"];
                     };
                 };
                 /** @description Bad Request */
@@ -5255,6 +5255,92 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/RoomReservations/{id}/services": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replaces the whole service basket of a pending reservation (Story 2.0 / D6 combined cart).
+         *     REPLACE semantics: the supplied lines become the complete basket; an empty list removes them all.
+         *     Refused once a payment is engaged, so the authorised amount can never drift from the total.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description The reservation identifier. */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            /** @description The new basket. */
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["ReplaceReservationServicesDto"];
+                    "text/json": components["schemas"]["ReplaceReservationServicesDto"];
+                    "application/*+json": components["schemas"]["ReplaceReservationServicesDto"];
+                };
+            };
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RoomReservationDtoApiResponse"];
+                    };
+                };
+                /** @description Bad Request */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Not Found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+            };
+        };
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -7050,6 +7136,19 @@ export interface components {
             newPassword?: string | null;
             confirmPassword?: string | null;
         };
+        ConfirmationResultDto: {
+            /** Format: uuid */
+            reservationId?: string;
+            /** Format: double */
+            grandTotal?: number;
+            droppedServices?: components["schemas"]["ReservationServiceLineDto"][] | null;
+        };
+        ConfirmationResultDtoApiResponse: {
+            readonly success?: boolean;
+            data?: components["schemas"]["ConfirmationResultDto"];
+            readonly message?: string | null;
+            readonly errors?: string[] | null;
+        };
         CreateHotelDto: {
             name: string | null;
             category?: string | null;
@@ -7090,6 +7189,18 @@ export interface components {
             successUrl?: string | null;
             cancelUrl?: string | null;
         };
+        CreateReservationServiceLineDto: {
+            /** Format: uuid */
+            serviceId: string;
+            /** Format: int32 */
+            quantity?: number;
+            /** Format: date-time */
+            serviceDate: string;
+            /** Format: time */
+            startTime?: string | null;
+            /** Format: time */
+            endTime?: string | null;
+        };
         CreateRoomDto: {
             number: string | null;
             category?: string | null;
@@ -7114,6 +7225,7 @@ export interface components {
             numberOfGuests?: number;
             paymentMethod?: components["schemas"]["PaymentMethod"];
             specialRequests?: string | null;
+            services?: components["schemas"]["CreateReservationServiceLineDto"][] | null;
         };
         CreateRoomReservationPaymentIntentDto: {
             /** Format: uuid */
@@ -7802,6 +7914,9 @@ export interface components {
         ReorderImagesRequest: {
             imageIds?: string[] | null;
         };
+        ReplaceReservationServicesDto: {
+            services?: components["schemas"]["CreateReservationServiceLineDto"][] | null;
+        };
         ReservationDto: {
             /** Format: uuid */
             id?: string;
@@ -7850,6 +7965,26 @@ export interface components {
          * @enum {integer}
          */
         ReservationEvent: 1 | 2 | 3;
+        ReservationServiceLineDto: {
+            /** Format: uuid */
+            id?: string;
+            /** Format: uuid */
+            serviceId?: string;
+            serviceName?: string | null;
+            /** Format: double */
+            price?: number;
+            /** Format: int32 */
+            quantity?: number;
+            /** Format: double */
+            totalPrice?: number;
+            /** Format: date-time */
+            serviceDate?: string;
+            /** Format: time */
+            startTime?: string | null;
+            /** Format: time */
+            endTime?: string | null;
+            status?: components["schemas"]["ReservationStatus"];
+        };
         /**
          * Format: int32
          * @enum {integer}
@@ -8036,6 +8171,11 @@ export interface components {
             status?: components["schemas"]["ReservationStatus"];
             specialRequests?: string | null;
             notes?: string | null;
+            /** Format: double */
+            servicesTotal?: number;
+            /** Format: double */
+            grandTotal?: number;
+            services?: components["schemas"]["ReservationServiceLineDto"][] | null;
             /** Format: date-time */
             createdAt?: string;
         };

@@ -6,6 +6,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Put,
   Query,
   Res,
   UseGuards,
@@ -24,6 +25,11 @@ import type { BookingQuoteDto } from './dto/booking-quote.dto';
 import { BookingQuoteQueryDto } from './dto/booking-quote.query.dto';
 import { CreateReservationRequestDto } from './dto/create-reservation.request.dto';
 import type { BookingReservationDto } from './dto/reservation.dto';
+import {
+  ReplaceReservationServicesRequestDto,
+  type UpsellCatalogDto,
+} from './dto/upsell-service.dto';
+import { UpsellQueryDto } from './dto/upsell.query.dto';
 
 /**
  * Frontière HTTP du domaine `booking` (tunnel de réservation) :
@@ -88,6 +94,49 @@ export class BookingController {
     );
     res.status(reservation.created ? HttpStatus.CREATED : HttpStatus.OK);
     return { success: true, data: reservation };
+  }
+
+  /**
+   * Catalogue d'upsell du séjour (story 2.6, AC-1/AC-2).
+   *
+   * **Gardé** : le catalogue de services d'un hôtel est `[RequireRole(Manager, Customer)]` côté PMS
+   * et l'upsell n'a de sens qu'une fois le voyageur dans le tunnel. Exposer cette lecture
+   * publiquement relèverait de la dépendance D9 (page hôtel SEO), qui n'est pas livrée.
+   */
+  @Get('services')
+  @UseGuards(SessionGuard)
+  async getUpsellServices(
+    @CurrentSession() session: RequestSession,
+    @Query() query: UpsellQueryDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiResponse<UpsellCatalogDto>> {
+    noStore(res);
+    return {
+      success: true,
+      data: await this.bookingService.getUpsellServices(session, query),
+    };
+  }
+
+  /**
+   * Remplace le panier de services d'une Réservation `Pending` (story 2.6, AC-5).
+   *
+   * Sémantique **replace** : le tableau envoyé devient le panier complet, un tableau vide retire
+   * tout. Refusé par le PMS dès qu'un paiement est engagé — traduit ici en motif métier
+   * (`services-locked`), jamais en 503.
+   */
+  @Put('reservations/:id/services')
+  @UseGuards(SessionGuard)
+  async replaceReservationServices(
+    @CurrentSession() session: RequestSession,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() body: ReplaceReservationServicesRequestDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiResponse<BookingReservationDto>> {
+    noStore(res);
+    return {
+      success: true,
+      data: await this.bookingService.replaceServices(session, id, body),
+    };
   }
 
   /**

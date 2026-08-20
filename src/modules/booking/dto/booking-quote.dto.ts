@@ -65,9 +65,14 @@ export interface BookingQuoteDto {
   taxAmount: null;
   taxState: TaxState;
   /**
-   * Total à payer (unités mineures). Égal à `roomTotal` aujourd'hui ; accueillera les services
-   * d'upsell quand D6 (panier combiné) sera livré. **Anti drip-pricing** (UX-DR-9.2) : ce montant
-   * est celui qui sera débité — aucun frais n'apparaît plus tard dans le tunnel.
+   * Total du séjour **chambre seule** (unités mineures), égal à `roomTotal`.
+   *
+   * ⚠️ Le devis précède l'étape d'upsell : à ce stade du tunnel, aucun service n'a encore pu être
+   * choisi. Les services s'ajoutent à l'étape paiement (story 2.6) et le montant qui engage
+   * devient alors le `total` de la RÉSERVATION (`grandTotal` du PMS), contrôlé à la création.
+   *
+   * **Anti drip-pricing** (UX-DR-9.2) : ce montant reste celui du séjour tel qu'annoncé ici ; tout
+   * ajout ultérieur est explicite, choisi, et immédiatement répercuté à l'écran.
    */
   total: number;
 
