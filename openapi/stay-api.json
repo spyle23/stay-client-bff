@@ -4889,7 +4889,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiResponse"
+                  "$ref": "#/components/schemas/ConfirmationResultDtoApiResponse"
                 }
               }
             }
@@ -5546,6 +5546,98 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/RoomReservations/{id}/services": {
+      "put": {
+        "tags": [
+          "RoomReservations"
+        ],
+        "summary": "Replaces the whole service basket of a pending reservation (Story 2.0 / D6 combined cart).\r\nREPLACE semantics: the supplied lines become the complete basket; an empty list removes them all.\r\nRefused once a payment is engaged, so the authorised amount can never drift from the total.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The reservation identifier.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The new basket.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplaceReservationServicesDto"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplaceReservationServicesDto"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplaceReservationServicesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomReservationDtoApiResponse"
                 }
               }
             }
@@ -8013,6 +8105,53 @@
         },
         "additionalProperties": false
       },
+      "ConfirmationResultDto": {
+        "type": "object",
+        "properties": {
+          "reservationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grandTotal": {
+            "type": "number",
+            "format": "double"
+          },
+          "droppedServices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReservationServiceLineDto"
+            },
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConfirmationResultDtoApiResponse": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "readOnly": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/ConfirmationResultDto"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true,
+            "readOnly": true
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true,
+            "readOnly": true
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateHotelDto": {
         "required": [
           "name"
@@ -8146,6 +8285,38 @@
         },
         "additionalProperties": false
       },
+      "CreateReservationServiceLineDto": {
+        "required": [
+          "serviceDate",
+          "serviceId"
+        ],
+        "type": "object",
+        "properties": {
+          "serviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "serviceDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "time",
+            "nullable": true
+          },
+          "endTime": {
+            "type": "string",
+            "format": "time",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateRoomDto": {
         "required": [
           "number"
@@ -8220,6 +8391,13 @@
           },
           "specialRequests": {
             "type": "string",
+            "nullable": true
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CreateReservationServiceLineDto"
+            },
             "nullable": true
           }
         },
@@ -9906,6 +10084,10 @@
           "publishableKey": {
             "type": "string",
             "nullable": true
+          },
+          "captureMethod": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -9955,7 +10137,8 @@
           4,
           5,
           6,
-          7
+          7,
+          8
         ],
         "type": "integer",
         "format": "int32"
@@ -10429,6 +10612,19 @@
         "additionalProperties": false,
         "description": "Request model for reordering images."
       },
+      "ReplaceReservationServicesDto": {
+        "type": "object",
+        "properties": {
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CreateReservationServiceLineDto"
+            },
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
       "ReservationDto": {
         "type": "object",
         "properties": {
@@ -10554,6 +10750,53 @@
         ],
         "type": "integer",
         "format": "int32"
+      },
+      "ReservationServiceLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "serviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "serviceName": {
+            "type": "string",
+            "nullable": true
+          },
+          "price": {
+            "type": "number",
+            "format": "double"
+          },
+          "quantity": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "totalPrice": {
+            "type": "number",
+            "format": "double"
+          },
+          "serviceDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "time",
+            "nullable": true
+          },
+          "endTime": {
+            "type": "string",
+            "format": "time",
+            "nullable": true
+          },
+          "status": {
+            "$ref": "#/components/schemas/ReservationStatus"
+          }
+        },
+        "additionalProperties": false
       },
       "ReservationStatus": {
         "enum": [
@@ -11129,6 +11372,21 @@
           },
           "notes": {
             "type": "string",
+            "nullable": true
+          },
+          "servicesTotal": {
+            "type": "number",
+            "format": "double"
+          },
+          "grandTotal": {
+            "type": "number",
+            "format": "double"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReservationServiceLineDto"
+            },
             "nullable": true
           },
           "createdAt": {

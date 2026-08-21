@@ -62,6 +62,14 @@ describe('auth/guest (e2e — Redis réel + PMS mocké)', () => {
   beforeAll(async () => {
     process.env.REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
     process.env.PMS_BASE_URL = `${PMS_HOST}${PMS_PREFIX}`;
+    // ⚠️ Cette suite n'exerce PAS le limiteur (c'est le rôle de `booking-reservation.e2e-spec.ts`) :
+    // ses ~20 soumissions partent du même email et de la même adresse et franchiraient les seuils
+    // par défaut. On les relève donc ici, plutôt que de purger `throttle:*` après chaque test :
+    // sur un Redis réel et **partagé** (`jest-e2e.json` ne fixe pas `maxWorkers`, les 12 suites
+    // tournent en parallèle), cette purge effaçait aussi les compteurs de la suite qui teste la
+    // limitation — dont les seuils devenaient dépendants de l'ordonnancement.
+    process.env.THROTTLE_IP_LIMIT = '1000';
+    process.env.THROTTLE_IDENTITY_LIMIT = '1000';
 
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
@@ -79,6 +87,9 @@ describe('auth/guest (e2e — Redis réel + PMS mocké)', () => {
   });
 
   afterEach(() => {
+    // Aucune purge par motif : les seuils relevés en `beforeAll` suffisent à immuniser la suite,
+    // et un `KEYS throttle:*` casserait les suites voisines (voir `beforeAll`). Les compteurs
+    // laissés derrière expirent seuls avec leur fenêtre.
     nock.cleanAll();
   });
 
