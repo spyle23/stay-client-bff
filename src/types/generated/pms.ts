@@ -7755,6 +7755,7 @@ export interface components {
             amountInCents?: number;
             currency?: string | null;
             publishableKey?: string | null;
+            captureMethod?: string | null;
         };
         PaymentIntentResultDtoApiResponse: {
             readonly success?: boolean;
@@ -7771,7 +7772,7 @@ export interface components {
          * Format: int32
          * @enum {integer}
          */
-        PaymentStatus: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+        PaymentStatus: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
         /**
          * Format: int32
          * @enum {integer}

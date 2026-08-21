@@ -119,6 +119,20 @@ redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
 return 1`;
 
 /**
+ * Retire `paymentStarted`, en un seul pas Redis — miroir exact de la pose.
+ *
+ * Renvoie `1` si le drapeau a été retiré, `0` si l'enregistrement n'existe pas (rien à faire),
+ * `-1` s'il est illisible.
+ */
+export const CLEAR_PAYMENT_STARTED_SCRIPT = `local raw = redis.call('get', KEYS[1])
+if not raw then return 0 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok then return -1 end
+record.paymentStarted = false
+redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
+return 1`;
+
+/**
  * Incrémente `attempts` **et** repousse le score d'index en un seul pas.
  *
  * Les deux vivaient dans deux appels distincts : un échec du second laissait le compteur
@@ -401,9 +415,43 @@ export class CheckoutHoldService {
    * perdre en réécrivant l'enregistrement entier.
    */
   async markPaymentStarted(reservationId: string): Promise<void> {
-    await this.guard(() =>
+    const applied = await this.guard(() =>
       this.redis.raw.eval(
         MARK_PAYMENT_STARTED_SCRIPT,
+        1,
+        HOLD_KEY_PREFIX + reservationId,
+        this.recordTtlSeconds,
+      ),
+    );
+
+    // ⚠️ Le script renvoie `0` (enregistrement absent) ou `-1` (JSON illisible) — deux cas où le
+    // drapeau n'a PAS été posé. Ils étaient ignorés : le `clientSecret` partait alors que
+    // l'invariant FR-14 n'était pas établi, et l'endpoint répondait 200. Seul un plantage Redis
+    // remontait. Trouvé en revue de code 3.1.
+    if (applied !== 1) {
+      this.logger.error(
+        `Gel de paiement impossible pour la réservation ${reservationId} ` +
+          `(enregistrement de hold absent ou illisible).`,
+      );
+      throw new ServiceUnavailableException(
+        'Service de réservation momentanément indisponible.',
+      );
+    }
+  }
+
+  /**
+   * Retire le drapeau `paymentStarted` — **uniquement** quand il est prouvé qu'aucun paiement ne
+   * peut exister (revue de code 3.1).
+   *
+   * Le gel est posé avant l'appel au PMS, ce qui est le seul instant sûr (FR-14). Mais un refus
+   * déterministe du PMS — devise non encaissable, réservation plus en attente — laissait la chambre
+   * immobilisée pour toujours, le balayeur ne touchant plus jamais un hold marqué. Le retrait suit
+   * le même patron atomique que la pose : la modification s'exécute dans Redis.
+   */
+  async clearPaymentStarted(reservationId: string): Promise<void> {
+    await this.guard(() =>
+      this.redis.raw.eval(
+        CLEAR_PAYMENT_STARTED_SCRIPT,
         1,
         HOLD_KEY_PREFIX + reservationId,
         this.recordTtlSeconds,

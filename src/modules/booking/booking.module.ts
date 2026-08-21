@@ -31,6 +31,8 @@ import { CheckoutHoldSweeper } from './checkout-hold.sweeper';
     CheckoutHoldService,
     CheckoutHoldSweeper,
   ],
-  exports: [CheckoutHoldService],
+  // `BookingService` est exporté pour le module `payment` (story 3.1) : la réservation qui fait foi
+  // sur le total et le statut se relit par ce service, pas par un second chemin d'accès au PMS.
+  exports: [CheckoutHoldService, BookingService],
 })
 export class BookingModule {}

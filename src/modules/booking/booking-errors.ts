@@ -211,8 +211,13 @@ export function classifyReservationFailure(
   return 'rejected';
 }
 
-/** Aplatit `errors` du PMS, qu'il soit un tableau de messages ou un dictionnaire par champ. */
-function flattenPmsErrors(
+/**
+ * Aplatit `errors` du PMS, qu'il soit un tableau de messages ou un dictionnaire par champ.
+ *
+ * Exporté pour le domaine `payment` (story 3.1), qui classe les mêmes réponses `ApiResponse.Fail`
+ * sous ses propres motifs : la forme du corps PMS n'a aucune raison d'être décodée deux fois.
+ */
+export function flattenPmsErrors(
   errors: Record<string, string[]> | string[] | undefined,
 ): string[] {
   if (!errors) {

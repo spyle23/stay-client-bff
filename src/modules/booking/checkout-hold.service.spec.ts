@@ -6,6 +6,7 @@ import type { BookingOptions } from './booking.constants';
 import {
   COMM_LOCALE_KEY_PREFIX,
   CheckoutHoldService,
+  CLEAR_PAYMENT_STARTED_SCRIPT,
   COMPARE_AND_DELETE_SCRIPT,
   COUNT_AND_RESCHEDULE_SCRIPT,
   DROP_INDEXED_SCRIPT,
@@ -99,12 +100,21 @@ class ScriptedRedis extends FakeRedis {
         await super.zrem(keys[1], String(argv[0]));
         return 1;
       }
-      case MARK_PAYMENT_STARTED_SCRIPT: {
-        const record = await this.decode(keys[0]);
-        if (!record) {
+      case MARK_PAYMENT_STARTED_SCRIPT:
+      case CLEAR_PAYMENT_STARTED_SCRIPT: {
+        // Le script renvoie 0 si l'enregistrement est absent, -1 s'il est illisible : ce sont les
+        // deux codes que le service DOIT désormais inspecter (revue de code 3.1).
+        const raw = await super.get(keys[0]);
+        if (raw === null) {
           return 0;
         }
-        record.paymentStarted = true;
+        let record: Record<string, unknown>;
+        try {
+          record = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          return -1;
+        }
+        record.paymentStarted = script === MARK_PAYMENT_STARTED_SCRIPT;
         await super.set(keys[0], JSON.stringify(record), 'EX', Number(argv[0]));
         return 1;
       }
@@ -380,10 +390,50 @@ describe('CheckoutHoldService', () => {
       expect(record?.sid).toBe('sid-1');
     });
 
-    it('markPaymentStarted sur un hold inconnu ne lève pas', async () => {
+    /**
+     * ⚠️ Comportement INVERSÉ en revue de code 3.1.
+     *
+     * Ce test affirmait auparavant qu'un hold inconnu « ne lève pas ». C'était précisément le
+     * défaut : le script Lua renvoie `0` quand l'enregistrement a disparu (TTL écoulé, éviction
+     * Redis) et `-1` quand il est illisible — deux cas où le drapeau n'a PAS été posé. Le code de
+     * retour étant ignoré, l'appelant poursuivait et renvoyait le `clientSecret` au navigateur alors
+     * que l'invariant FR-14 (« geler avant d'émettre ») n'était pas établi, avec un 200 à la clé.
+     *
+     * Échouer bruyamment est le seul comportement sûr : une chambre que le balayeur peut encore
+     * annuler ne doit pas se retrouver payable.
+     */
+    it('markPaymentStarted ÉCHOUE quand le hold est absent : FR-14 ne peut pas être établi', async () => {
       await expect(
         service.markPaymentStarted('inconnu'),
-      ).resolves.toBeUndefined();
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
+
+    it('markPaymentStarted échoue aussi sur un enregistrement illisible', async () => {
+      await redis.set(
+        HOLD_KEY_PREFIX + 'corrompu',
+        'ceci-n-est-pas-du-json',
+        60,
+      );
+
+      await expect(
+        service.markPaymentStarted('corrompu'),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
+
+    /**
+     * Revue de code 3.1 — le gel doit pouvoir être relâché quand il est prouvé qu'aucun paiement
+     * ne peut exister (refus PMS antérieur à tout appel Stripe). Sans cela, une réservation
+     * structurellement impayable immobilisait la chambre pour toujours.
+     */
+    it('clearPaymentStarted relâche le gel sans perdre le reste de l’enregistrement', async () => {
+      await service.markPaymentStarted(RESERVATION_ID);
+      expect((await service.read(RESERVATION_ID))?.paymentStarted).toBe(true);
+
+      await service.clearPaymentStarted(RESERVATION_ID);
+
+      const record = await service.read(RESERVATION_ID);
+      expect(record?.paymentStarted).toBe(false);
+      expect(record?.sid).toBe('sid-1');
     });
 
     /**
