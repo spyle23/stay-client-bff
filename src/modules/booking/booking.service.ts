@@ -341,6 +341,7 @@ export class BookingService {
       dto.hotelId,
       currency,
       dto.services ?? [],
+      includedServiceNames(room),
     );
     this.assertBookable(dto, room, currency, servicesTotal);
 
@@ -868,9 +869,7 @@ export class BookingService {
           guests: query.guests,
         },
       );
-      includedNames = new Set(
-        room.includedServices.map((s) => normalizeServiceName(s.name)),
-      );
+      includedNames = includedServiceNames(room);
     } catch {
       this.logger.warn(
         `Fiche chambre indisponible (hôtel ${query.hotelId}, chambre ${query.roomId}) : ` +
@@ -879,7 +878,17 @@ export class BookingService {
       return { services: [], degraded: true };
     }
 
-    const currency = await this.hotelCurrency(query.hotelId);
+    // Devise illisible : la section est tue, le tunnel reste ouvert (revue #2). Laisser remonter
+    // l'erreur de `hotelCurrency` transformait une section facultative en 503 sur l'étape paiement.
+    let currency: string;
+    try {
+      currency = await this.hotelCurrency(query.hotelId);
+    } catch {
+      this.logger.warn(
+        `Devise de l'hôtel ${query.hotelId} indisponible : section upsell masquée.`,
+      );
+      return { services: [], degraded: true };
+    }
 
     let raw: PmsHotelService[];
     try {
@@ -970,6 +979,7 @@ export class BookingService {
     hotelId: string,
     currency: string,
     lines: readonly ReservationServiceLineRequestDto[],
+    includedNames: ReadonlySet<string>,
   ): Promise<number> {
     if (lines.length === 0) {
       return 0;
@@ -1000,7 +1010,13 @@ export class BookingService {
     let total = 0;
     for (const line of lines) {
       const service = byId.get(line.serviceId);
-      if (service === undefined || !isSellableService(service)) {
+      // Même règle que le catalogue (AC-2) : un service compris dans le tarif n'est jamais vendu,
+      // même par un corps forgé qui le demanderait sans être passé par `GET /booking/services`.
+      if (
+        service === undefined ||
+        !isSellableService(service) ||
+        includedNames.has(normalizeServiceName(service.name as string))
+      ) {
         throw toBookingException('service-unavailable');
       }
       total += toMinorUnits(service.price as number, currency) * line.quantity;
@@ -1213,12 +1229,24 @@ function isSellableService(service: PmsHotelService): boolean {
  * = exposer `serviceId` sur les services inclus (candidat dépendance PMS, consigné).
  */
 function normalizeServiceName(name: string): string {
-  return name
-    .trim()
-    .toLocaleLowerCase('fr-FR')
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .replace(/\s+/g, ' ');
+  return (
+    name
+      .toLocaleLowerCase('fr-FR')
+      .normalize('NFD')
+      .replace(/\p{Diacritic}/gu, '')
+      // Traits d'union, soulignés et apostrophes séparent des mots comme une espace : « Petit-
+      // déjeuner » (jeu de référence) et « Petit déjeuner » désignent le même service (revue #2).
+      .replace(/[-\u2010-\u2015_'\u2019]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
+}
+
+/** Noms normalisés des services compris dans le tarif de la chambre (AC-2). */
+function includedServiceNames(room: RoomDetailDto): ReadonlySet<string> {
+  return new Set(
+    room.includedServices.map((s) => normalizeServiceName(s.name)),
+  );
 }
 
 /** Ligne de panier au format attendu par le PMS (date ancrée UTC). */

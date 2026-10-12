@@ -635,3 +635,180 @@ describe('modification du panier (AC-5)', () => {
     ).rejects.not.toBeInstanceOf(ConflictException);
   });
 });
+
+describe('revue du livré (spyle23/hotelerie#2)', () => {
+  /** Catalogue PMS réduit à un service, sous le nom voulu. */
+  function catalogOf(service: Record<string, unknown>) {
+    return (path: string) =>
+      path.includes('/services')
+        ? Promise.resolve({
+            success: true,
+            data: [
+              {
+                id: BREAKFAST_ID,
+                hotelId: HOTEL_ID,
+                price: 12.5,
+                unit: null,
+                description: null,
+                isActive: true,
+                isExternallyBookable: true,
+                externalQuantity: 0,
+                ...service,
+              },
+            ],
+          })
+        : Promise.resolve({ success: true, data: pmsReservation() });
+  }
+
+  it.each([
+    ['la casse', 'PETIT DEJEUNER', 'petit dejeuner'],
+    ['les accents', 'Petit déjeuner', 'Petit dejeuner'],
+    ['les espaces', '  Petit    déjeuner ', 'Petit déjeuner'],
+    [
+      'le trait d’union du jeu de référence',
+      'Petit déjeuner',
+      'Petit-dejeuner',
+    ],
+  ])(
+    'AC-7 : exclut un service inclus dont le nom diffère par %s',
+    async (_cause, included, sold) => {
+      const deps = makeDeps();
+      deps.getRoomDetail.mockResolvedValue(
+        roomDetail({
+          includedServices: [{ name: included, quantity: 1, notes: null }],
+        }),
+      );
+      deps.get.mockImplementation(catalogOf({ name: sold }));
+
+      const result = await buildService(deps).getUpsellServices(
+        SESSION,
+        UPSELL_QUERY,
+      );
+
+      expect(result).toEqual({ services: [], degraded: false });
+    },
+  );
+
+  it('AC-7 : ne rapproche pas deux services réellement différents', async () => {
+    const deps = makeDeps();
+    deps.getRoomDetail.mockResolvedValue(
+      roomDetail({
+        includedServices: [
+          { name: 'Petit déjeuner', quantity: 1, notes: null },
+        ],
+      }),
+    );
+    deps.get.mockImplementation(catalogOf({ name: 'Dîner' }));
+
+    const result = await buildService(deps).getUpsellServices(
+      SESSION,
+      UPSELL_QUERY,
+    );
+
+    expect(result.services.map((s) => s.name)).toEqual(['Dîner']);
+  });
+
+  it.each([1, 2, 50])(
+    'AC-7 : ne propose jamais un service à stock fini (externalQuantity = %i)',
+    async (externalQuantity) => {
+      const deps = makeDeps();
+      deps.get.mockImplementation(
+        catalogOf({ name: 'Billard', externalQuantity }),
+      );
+
+      const result = await buildService(deps).getUpsellServices(
+        SESSION,
+        UPSELL_QUERY,
+      );
+
+      expect(result.services).toHaveLength(0);
+    },
+  );
+
+  it('refuse à la création un service déjà inclus dans la chambre, sans rien écrire', async () => {
+    const deps = makeDeps();
+    deps.getRoomDetail.mockResolvedValue(
+      roomDetail({
+        includedServices: [
+          { name: 'Petit déjeuner', quantity: 1, notes: null },
+        ],
+      }),
+    );
+    deps.get.mockImplementation(catalogOf({ name: 'Petit-dejeuner' }));
+
+    // Le catalogue ne le propose pas, mais un corps forgé le pourrait : le voyageur paierait un
+    // service compris dans son tarif.
+    await expect(
+      buildService(deps).createReservation(
+        SESSION,
+        createBody({
+          expectedTotal: 18_050,
+          services: [
+            { serviceId: BREAKFAST_ID, quantity: 1, serviceDate: SERVICE_DATE },
+          ],
+        }),
+      ),
+    ).rejects.toMatchObject({
+      response: { errors: { [BOOKING_REASON_KEY]: ['service-unavailable'] } },
+    });
+
+    expect(deps.registerIntent).not.toHaveBeenCalled();
+    expect(deps.post).not.toHaveBeenCalled();
+  });
+
+  it('refuse à la création un service à stock fini, sans rien écrire', async () => {
+    const deps = makeDeps();
+    deps.get.mockImplementation(
+      catalogOf({ name: 'Billard', externalQuantity: 2 }),
+    );
+
+    await expect(
+      buildService(deps).createReservation(
+        SESSION,
+        createBody({
+          expectedTotal: 18_050,
+          services: [
+            { serviceId: BREAKFAST_ID, quantity: 1, serviceDate: SERVICE_DATE },
+          ],
+        }),
+      ),
+    ).rejects.toMatchObject({
+      response: { errors: { [BOOKING_REASON_KEY]: ['service-unavailable'] } },
+    });
+
+    expect(deps.post).not.toHaveBeenCalled();
+  });
+
+  it('dégrade le catalogue, sans fermer le tunnel, quand la devise de l’hôtel est illisible', async () => {
+    const deps = makeDeps();
+    deps.getHotelCurrency.mockRejectedValue(
+      new PmsRequestError('Le PMS a renvoyé le statut 400', 400),
+    );
+
+    const result = await buildService(deps).getUpsellServices(
+      SESSION,
+      UPSELL_QUERY,
+    );
+
+    expect(result).toEqual({ services: [], degraded: true });
+  });
+
+  it('AC-6 : classe le gel sous la forme réelle du PMS (`errors`, `message` nul)', async () => {
+    const deps = makeDeps();
+    deps.put.mockRejectedValue(
+      new PmsRequestError('Le PMS a renvoyé le statut 400', 400, {
+        errors: [
+          'Cannot modify services: a payment is already engaged for this reservation',
+        ],
+      }),
+    );
+
+    await expect(
+      buildService(deps).replaceServices(SESSION, RESERVATION_ID, {
+        services: [],
+      }),
+    ).rejects.toMatchObject({
+      response: { errors: { [BOOKING_REASON_KEY]: ['services-locked'] } },
+    });
+  });
+});
