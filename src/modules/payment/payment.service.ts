@@ -1,5 +1,7 @@
 import {
   HttpException,
+  HttpStatus,
+  Inject,
   Injectable,
   Logger,
   ServiceUnavailableException,
@@ -7,12 +9,26 @@ import {
 import { createHash } from 'node:crypto';
 import type { RequestSession } from '../../common/decorators/current-session.decorator';
 import { CorrelationService } from '../../common/correlation/correlation.service';
+import { toMinorUnits } from '../../common/money/minor-units';
 import type { PmsRequestContext } from '../../integration/pms/pms-client.service';
 import { PmsClientService } from '../../integration/pms/pms-client.service';
+import { PmsRequestError } from '../../integration/pms/pms-errors';
+import { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
 import type { components } from '../../types/generated/pms';
 import { SessionService } from '../auth/session.service';
 import { BookingService } from '../booking/booking.service';
 import { CheckoutHoldService } from '../booking/checkout-hold.service';
+import type {
+  BookingReservationDto,
+  ReservationStatusName,
+} from '../booking/dto/reservation.dto';
+import {
+  classifyConfirmFailure,
+  PMS_CONFIRMATION_ENDPOINTS,
+  toConfirmException,
+} from './confirm-errors';
+import { ConfirmationLockService } from './confirmation-lock.service';
+import type { ConfirmationProofDto } from './dto/confirmation-proof.dto';
 import type { PaymentIntentDto } from './dto/payment-intent.dto';
 import {
   classifyPaymentFailure,
@@ -20,8 +36,25 @@ import {
   PMS_PAYMENT_ENDPOINTS,
   toPaymentException,
 } from './payment-errors';
+import { PAYMENT_OPTIONS, type PaymentOptions } from './payment.constants';
 
 type PmsPaymentIntent = components['schemas']['PaymentIntentResultDto'];
+type PmsConfirmation = components['schemas']['ConfirmationResultDto'];
+
+/**
+ * Statuts déjà au-delà de la confirmation : la preuve se construit depuis la relecture, sans
+ * appeler le PMS (chemin idempotent rapide, AC-2). Un séjour commencé ou terminé a forcément été
+ * confirmé.
+ */
+const PAST_CONFIRMATION: ReadonlySet<ReservationStatusName> = new Set([
+  'Confirmed',
+  'CheckedIn',
+  'CheckedOut',
+]);
+
+/** Message des confirmations encore en vol au-delà de l'attente du perdant — rejouable. */
+const CONFIRMATION_IN_FLIGHT_MESSAGE =
+  'Votre confirmation est en cours de traitement. Réessayez dans un instant.';
 
 /** Message unique des ruptures de contrat PMS — jamais de détail technique côté navigateur. */
 const BROKEN_CONTRACT_MESSAGE = 'Réponse inattendue du service de paiement.';
@@ -52,7 +85,259 @@ export class PaymentService {
     private readonly booking: BookingService,
     private readonly holds: CheckoutHoldService,
     private readonly correlation: CorrelationService,
+    private readonly serviceKey: ServiceKeyProvider,
+    private readonly confirmLock: ConfirmationLockService,
+    @Inject(PAYMENT_OPTIONS) private readonly options: PaymentOptions,
   ) {}
+
+  // --- Confirmation ferme (story 3.2) -------------------------------------------------------
+
+  /**
+   * Confirme la Réservation après autorisation et rend la **preuve** (story 3.2, B3).
+   *
+   * L'ordre est l'invariant :
+   * 1. relire la réservation **sous l'identité du voyageur** (propriété + statut) ;
+   * 2. déjà confirmée → preuve depuis cette relecture, `forget`, **aucun** appel PMS ;
+   * 3. verrou single-flight Redis (deux onglets → un seul appel) ;
+   * 4. `POST /reservations/{id}/confirm` sous `X-Service-Key` (le PMS capture puis confirme) ;
+   * 5. succès → `holds.forget` (jamais `release`), preuve relue du serveur.
+   *
+   * ⚠️ Les remparts 1 à 3 sont du confort et de l'économie d'appels. Les garanties d'idempotence
+   * (une capture, une transition, un e-mail) sont celles du PMS (#152).
+   */
+  async confirm(
+    session: RequestSession,
+    reservationId: string,
+  ): Promise<ConfirmationProofDto> {
+    return this.confirmOnce(session, reservationId, true);
+  }
+
+  private async confirmOnce(
+    session: RequestSession,
+    reservationId: string,
+    mayWait: boolean,
+  ): Promise<ConfirmationProofDto> {
+    // 1. Relecture sous l'identité du voyageur : le PMS refuse (404) la réservation d'un tiers.
+    const reservation = await this.readForConfirmation(session, reservationId);
+
+    // 2. Chemin idempotent rapide : rechargement, retour arrière, second onglet arrivé après coup.
+    if (PAST_CONFIRMATION.has(reservation.status)) {
+      await this.forgetHold(reservationId);
+      return toProof(reservation, {
+        capturedAmount: null,
+        alreadyConfirmed: true,
+      });
+    }
+    if (reservation.status === 'Cancelled') {
+      throw toConfirmException('reservation-cancelled');
+    }
+    if (reservation.status !== 'Pending') {
+      // NoShow ou statut inconnu : ne jamais tenter de confirmer un état qu'on ne comprend pas.
+      throw toConfirmException('rejected');
+    }
+
+    // 3. Verrou single-flight. Une panne Redis remonte ici en 503 (jamais 500) et interrompt tout :
+    //    aucun appel PMS ne part sans le verrou.
+    const token = await this.confirmLock.acquire(reservationId);
+    if (token === null) {
+      if (!mayWait) {
+        throw new ServiceUnavailableException(CONFIRMATION_IN_FLIGHT_MESSAGE);
+      }
+      // Un autre onglet confirme : attendre qu'il ait fini, puis RELIRE. Déjà confirmée → la même
+      // preuve ; toujours `Pending` (le gagnant a échoué) → une seule nouvelle tentative.
+      await this.waitForConfirmationInFlight(reservationId);
+      return this.confirmOnce(session, reservationId, false);
+    }
+
+    try {
+      // 4. Confirmation PMS (capture comprise, #152).
+      const result = await this.requestPmsConfirmation(reservationId);
+
+      // 5. Preuve relue du serveur, puis le hold sort de l'index du balayeur.
+      const proof = await this.proofAfterConfirmation(
+        session,
+        reservation,
+        result,
+      );
+      await this.forgetHold(reservationId);
+      return proof;
+    } finally {
+      await this.confirmLock.release(reservationId, token);
+    }
+  }
+
+  /** Relecture de la réservation, avec le motif de confirmation sur une réservation introuvable. */
+  private async readForConfirmation(
+    session: RequestSession,
+    reservationId: string,
+  ): Promise<BookingReservationDto> {
+    try {
+      return await this.booking.getReservation(session, reservationId);
+    } catch (err) {
+      // `booking` signale l'introuvable (ou la réservation d'un autre compte) par son propre motif :
+      // l'écran de confirmation attend le sien.
+      if (
+        err instanceof HttpException &&
+        err.getStatus() === Number(HttpStatus.NOT_FOUND)
+      ) {
+        throw toConfirmException('reservation-not-found');
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * `POST /reservations/{id}/confirm` sous `X-Service-Key` — la SEULE route qui le porte (AR-8).
+   *
+   * **`maxRetries` par défaut** — contrairement à l'intent : le PMS garantit l'idempotence de cette
+   * route (transition sous verrou, capture idempotente), et c'est justement le rejeu qui protège
+   * contre une réponse perdue après capture.
+   */
+  private async requestPmsConfirmation(
+    reservationId: string,
+  ): Promise<PmsConfirmation> {
+    const path = PMS_CONFIRMATION_ENDPOINTS.confirm(reservationId);
+
+    let ctx: PmsRequestContext;
+    try {
+      ctx = this.serviceKey.confirmationContext(path, {
+        ...this.pmsContext(),
+        idempotencyKey: this.confirmIdempotencyKey(reservationId),
+      });
+    } catch (err) {
+      // Clé de service absente : configuration du BFF, pas une faute du voyageur → 503.
+      this.logger.error(
+        `Confirmation impossible : ${err instanceof Error ? err.message : 'clé de service indisponible'}`,
+      );
+      throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
+    }
+
+    let data: PmsConfirmation | undefined;
+    try {
+      data = (await this.pms.post<PmsConfirmation>(path, undefined, ctx)).data;
+    } catch (err) {
+      const reason = classifyConfirmFailure(err);
+      if (reason !== null) {
+        this.logger.warn(
+          `Confirmation refusée pour la réservation ${reservationId} : « ${reason} ».`,
+        );
+        throw toConfirmException(reason);
+      }
+      if (
+        err instanceof PmsRequestError &&
+        (err.status === 401 || err.status === 403)
+      ) {
+        this.logger.error(
+          `Clé de service refusée par le PMS (statut ${err.status}) sur la confirmation.`,
+        );
+        throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
+      }
+      throw err; // panne → 503 par le filtre global
+    }
+
+    if (!data) {
+      this.logger.error(
+        `Contrat PMS rompu sur la confirmation de la réservation ${reservationId} : réponse vide.`,
+      );
+      throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
+    }
+    return data;
+  }
+
+  /**
+   * Preuve **relue du serveur** après confirmation : les lignes de service écartées au moment de la
+   * confirmation (D6) ont changé le total, et c'est l'état persisté qui fait foi.
+   *
+   * Relecture en échec : la confirmation a pourtant réussi. Plutôt que de faire réessayer au
+   * voyageur une opération déjà faite, la preuve est reconstituée depuis la première lecture et le
+   * résultat du PMS (statut confirmé, lignes écartées annulées, total du PMS).
+   */
+  private async proofAfterConfirmation(
+    session: RequestSession,
+    before: BookingReservationDto,
+    result: PmsConfirmation,
+  ): Promise<ConfirmationProofDto> {
+    const flags = {
+      capturedAmount: this.capturedMinorUnits(result, before.currency),
+      alreadyConfirmed: result.alreadyConfirmed === true,
+    };
+
+    try {
+      const after = await this.booking.getReservation(
+        session,
+        before.reservationId,
+      );
+      return toProof(after, flags);
+    } catch {
+      this.logger.warn(
+        `Relecture impossible après confirmation de la réservation ${before.reservationId} : ` +
+          'preuve reconstituée depuis la réponse du PMS.',
+      );
+      return toProof(reconstituted(before, result), flags);
+    }
+  }
+
+  /**
+   * Montant encaissé en unités mineures, ou `null` s'il ne peut pas être affiché honnêtement.
+   *
+   * Le PMS rend des unités MAJEURES dans la devise de l'hôtel. Une devise qui diverge de celle de la
+   * réservation relue est une rupture de contrat : afficher ce montant dans la mauvaise devise serait
+   * pire que de ne pas l'afficher.
+   */
+  private capturedMinorUnits(
+    result: PmsConfirmation,
+    currency: string,
+  ): number | null {
+    const captured = result.capturedAmount;
+    const pmsCurrency = result.currency ?? currency;
+    if (typeof captured !== 'number' || !Number.isFinite(captured)) {
+      return null;
+    }
+    if (pmsCurrency.toUpperCase() !== currency.toUpperCase()) {
+      this.logger.error(
+        `Devise de confirmation divergente : PMS ${pmsCurrency}, réservation ${currency}.`,
+      );
+      return null;
+    }
+    return toMinorUnits(captured, currency);
+  }
+
+  /**
+   * Retire la réservation de l'index du balayeur — **`forget`, jamais `release`** (D-7) : purger la
+   * clé d'idempotence rouvrirait la porte à une seconde réservation pour le même séjour.
+   *
+   * Best-effort : la confirmation est faite, et le balayeur ignore déjà une `Confirmed`. Une panne
+   * Redis ici ne doit pas transformer une réussite en erreur.
+   */
+  private async forgetHold(reservationId: string): Promise<void> {
+    try {
+      await this.holds.forget(reservationId);
+    } catch {
+      this.logger.warn(
+        `Hold de la réservation ${reservationId} non retiré de l'index (le balayeur ignorera la Confirmed).`,
+      );
+    }
+  }
+
+  /** Attend la fin d'une confirmation en vol (verrou rendu ou expiré), au plus `confirmWaitTimeoutMs`. */
+  private async waitForConfirmationInFlight(
+    reservationId: string,
+  ): Promise<void> {
+    const deadline = Date.now() + this.options.confirmWaitTimeoutMs;
+    while (Date.now() < deadline) {
+      await delay(this.options.confirmPollIntervalMs);
+      if (!(await this.confirmLock.isHeld(reservationId))) {
+        return;
+      }
+    }
+  }
+
+  /** Clé d'idempotence stable par réservation, hachée (aucun identifiant en clair sur le fil). */
+  private confirmIdempotencyKey(reservationId: string): string {
+    return createHash('sha1')
+      .update(`reservation-confirm|${reservationId}`)
+      .digest('hex');
+  }
 
   /**
    * Émet (ou réémet) le PaymentIntent de la réservation et le rend exploitable par le navigateur.
@@ -300,4 +585,68 @@ function reasonOf(err: unknown): string | null {
   return Array.isArray(reason) && typeof reason[0] === 'string'
     ? reason[0]
     : null;
+}
+
+/** Projection réduite de la preuve (B4) : liste blanche, aucune PII, aucun jeton. */
+function toProof(
+  reservation: BookingReservationDto,
+  flags: { capturedAmount: number | null; alreadyConfirmed: boolean },
+): ConfirmationProofDto {
+  return {
+    reservationId: reservation.reservationId,
+    reservationCode: reservation.reservationCode,
+    status: reservation.status,
+    hotelName: reservation.hotelName,
+    roomNumber: reservation.roomNumber,
+    roomCategory: reservation.roomCategory,
+    checkInDate: reservation.checkInDate,
+    checkOutDate: reservation.checkOutDate,
+    nights: reservation.nights,
+    guests: reservation.guests,
+    currency: reservation.currency,
+    total: reservation.total,
+    roomTotal: reservation.roomTotal,
+    servicesTotal: reservation.servicesTotal,
+    services: reservation.services,
+    capturedAmount: flags.capturedAmount,
+    communicationLocale: reservation.communicationLocale,
+    // Porté par `BookingService.toReservationDto`, SEUL point de bascule D10 avec
+    // `buildPmsCreateBody` : aucun second interrupteur ici.
+    communicationLocaleState: reservation.communicationLocaleState,
+    alreadyConfirmed: flags.alreadyConfirmed,
+  };
+}
+
+/** Réservation telle que la confirmation l'a laissée, quand la relecture finale est impossible. */
+function reconstituted(
+  before: BookingReservationDto,
+  result: PmsConfirmation,
+): BookingReservationDto {
+  const dropped = new Set(
+    (result.droppedServices ?? [])
+      .map((line) => line.id)
+      .filter((id): id is string => typeof id === 'string'),
+  );
+  const services = before.services.map((line) => ({
+    ...line,
+    status: dropped.has(line.lineId)
+      ? ('Cancelled' as const)
+      : ('Confirmed' as const),
+  }));
+  const total =
+    typeof result.grandTotal === 'number' && Number.isFinite(result.grandTotal)
+      ? toMinorUnits(result.grandTotal, before.currency)
+      : before.total;
+  return {
+    ...before,
+    reservationCode: result.reservationCode || before.reservationCode,
+    status: 'Confirmed',
+    services,
+    total,
+    servicesTotal: Math.max(0, total - before.roomTotal),
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

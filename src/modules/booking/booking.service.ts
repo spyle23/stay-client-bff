@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   BadRequestException,
+  NotFoundException,
   Inject,
   Injectable,
   Logger,
@@ -10,7 +11,10 @@ import type { RequestSession } from '../../common/decorators/current-session.dec
 import { toMinorUnits } from '../../common/money/minor-units';
 import { CorrelationService } from '../../common/correlation/correlation.service';
 import type { PmsRequestContext } from '../../integration/pms/pms-client.service';
-import { PmsClientService } from '../../integration/pms/pms-client.service';
+import {
+  type PmsBinaryResponse,
+  PmsClientService,
+} from '../../integration/pms/pms-client.service';
 import { PmsRequestError } from '../../integration/pms/pms-errors';
 import type { components } from '../../types/generated/pms';
 import { CatalogService } from '../catalog/catalog.service';
@@ -65,6 +69,25 @@ const PAYMENT_METHOD_STRIPE = 4;
 
 /** Message unique des ruptures de contrat PMS — jamais de détail technique côté navigateur. */
 const BROKEN_CONTRACT_MESSAGE = 'Réponse inattendue du service de réservation.';
+
+/** Documents de confirmation exposés au voyageur (story 3.2). */
+export type ConfirmationDocumentKind = 'pdf' | 'qr';
+
+export interface ConfirmationDocument {
+  data: Buffer;
+  contentType: string;
+  /** Nom de téléchargement reconstruit par le BFF (PDF seulement). */
+  fileName: string | null;
+}
+
+/** Seul type accepté pour chaque document : tout autre corps amont est une rupture de contrat. */
+const DOCUMENT_TYPES: Record<ConfirmationDocumentKind, string> = {
+  pdf: 'application/pdf',
+  qr: 'image/png',
+};
+
+/** Forme d'un code de réservation PMS (`RES-AAAAMMJJ-XXXXX`) sûre dans un `Content-Disposition`. */
+const SAFE_CODE = /^[A-Za-z0-9-]{1,64}$/;
 
 /** `ReservationStatus` du PMS → nom exploitable par le front. */
 const STATUS_NAMES: Record<number, ReservationStatusName> = {
@@ -248,6 +271,91 @@ export class BookingService {
       ...(await this.reservationContextOf(reservationId)),
       created: false,
     });
+  }
+
+  /**
+   * Document de confirmation (PDF ou QR) d'une réservation du voyageur (story 3.2, B6).
+   *
+   * Lu sous le JWT `Customer` en custody : le PMS refuse (404) tout autre que le propriétaire d'une
+   * réservation `Confirmed`. Les octets sont relayés **intacts** ; seul le type attendu passe.
+   *
+   * ⚠️ Le nom du PDF est **reconstruit** ici depuis le code de réservation relu : aucun en-tête venu
+   * d'amont n'est relayé tel quel au navigateur. Un code illisible donne un nom générique.
+   */
+  async getConfirmationDocument(
+    session: RequestSession,
+    reservationId: string,
+    kind: ConfirmationDocumentKind,
+  ): Promise<ConfirmationDocument> {
+    const path =
+      kind === 'pdf'
+        ? PMS_RESERVATION_ENDPOINTS.confirmationPdf(reservationId)
+        : PMS_RESERVATION_ENDPOINTS.confirmationQr(reservationId);
+
+    const [document, code] = await Promise.all([
+      this.fetchDocument(session, path),
+      kind === 'pdf'
+        ? this.reservationCodeOf(session, reservationId)
+        : Promise.resolve(null),
+    ]);
+
+    if (
+      document.contentType.split(';')[0].trim().toLowerCase() !==
+      DOCUMENT_TYPES[kind]
+    ) {
+      this.logger.error(
+        `Document ${kind} de la réservation ${reservationId} servi avec un type inattendu.`,
+      );
+      throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
+    }
+
+    return {
+      data: document.data,
+      contentType: DOCUMENT_TYPES[kind],
+      fileName:
+        kind === 'pdf'
+          ? `${code !== null && SAFE_CODE.test(code) ? code : 'reservation'}.pdf`
+          : null,
+    };
+  }
+
+  private async fetchDocument(
+    session: RequestSession,
+    path: string,
+  ): Promise<PmsBinaryResponse> {
+    try {
+      return await this.sessions.withCustomerAuth(session.sid, (token) =>
+        this.pms.getBinary(path, { ...this.pmsContext(), bearerToken: token }),
+      );
+    } catch (err) {
+      if (
+        err instanceof PmsRequestError &&
+        err.status >= 400 &&
+        err.status < 500 &&
+        err.status !== 401
+      ) {
+        // Introuvable, pas encore confirmée ou d'un autre compte : indiscernables à dessein. Le
+        // texte du PMS ne sort pas.
+        throw new NotFoundException({
+          message: 'Document de confirmation introuvable.',
+          errors: { reason: ['document-not-found'] },
+        });
+      }
+      throw err; // 401 géré par withCustomerAuth ; panne → 503
+    }
+  }
+
+  /** Code de réservation relu (pour nommer le PDF), ou `null` — jamais bloquant. */
+  private async reservationCodeOf(
+    session: RequestSession,
+    reservationId: string,
+  ): Promise<string | null> {
+    try {
+      const reservation = await this.fetchReservation(session, reservationId);
+      return reservation?.reservationCode ?? null;
+    } catch {
+      return null;
+    }
   }
 
   // --- Interne : création ------------------------------------------------------------------

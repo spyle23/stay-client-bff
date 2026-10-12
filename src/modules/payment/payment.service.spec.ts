@@ -8,6 +8,9 @@ import { SessionService } from '../auth/session.service';
 import { BookingService } from '../booking/booking.service';
 import { CheckoutHoldService } from '../booking/checkout-hold.service';
 import type { BookingReservationDto } from '../booking/dto/reservation.dto';
+import { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
+import { ConfirmationLockService } from './confirmation-lock.service';
+import { PAYMENT_OPTIONS } from './payment.constants';
 import { PaymentService } from './payment.service';
 
 /**
@@ -96,6 +99,10 @@ describe('PaymentService', () => {
           provide: CorrelationService,
           useValue: { getCorrelationId: () => 'corr-1' },
         },
+        // Story 3.2 : dépendances de la confirmation, inertes pour l'intent.
+        { provide: ServiceKeyProvider, useValue: {} },
+        { provide: ConfirmationLockService, useValue: {} },
+        { provide: PAYMENT_OPTIONS, useValue: {} },
       ],
     }).compile();
 

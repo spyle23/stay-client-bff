@@ -345,4 +345,120 @@ describe('PmsClientService', () => {
       expect(svc.circuitOpen).toBe(false);
     });
   });
+
+  // Story 3.2 (#3) : la confirmation répond 502 sur un échec Stripe, avec un motif TEXTUEL que le
+  // BFF doit pouvoir classer une fois les retries épuisés (capture échouée ≠ autorisation expirée).
+  describe('dernier 5xx conservé après retries', () => {
+    it('PmsUnavailableError porte le statut et le corps du dernier 5xx', async () => {
+      const svc = createService({ maxRetries: 1 });
+      const body = { success: false, errors: ['Payment capture failed'] };
+      nock(HOST)
+        .post('/api/v1/reservations/r1/confirm')
+        .times(2)
+        .reply(502, body);
+
+      const err: unknown = await svc
+        .post('/reservations/r1/confirm')
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(PmsUnavailableError);
+      expect((err as PmsUnavailableError).status).toBe(502);
+      expect((err as PmsUnavailableError).responseBody).toEqual(body);
+    });
+
+    it("une panne réseau ne porte ni statut ni corps (rien n'a été répondu)", async () => {
+      const svc = createService({ maxRetries: 0 });
+      nock(HOST).get('/api/v1/ping').replyWithError('down');
+
+      const err: unknown = await svc.get('/ping').catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(PmsUnavailableError);
+      expect((err as PmsUnavailableError).status).toBeUndefined();
+      expect((err as PmsUnavailableError).responseBody).toBeUndefined();
+    });
+  });
+
+  describe('getBinary (documents PDF/QR, story 3.2)', () => {
+    const PNG = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0,
+    ]);
+
+    it('renvoie les octets intacts et le Content-Type amont', async () => {
+      const svc = createService();
+      nock(HOST)
+        .get('/api/v1/roomreservations/r1/confirmation-qr')
+        .reply(200, PNG, { 'Content-Type': 'image/png' });
+
+      const res = await svc.getBinary('/roomreservations/r1/confirmation-qr');
+
+      expect(Buffer.isBuffer(res.data)).toBe(true);
+      expect(res.data.equals(PNG)).toBe(true);
+      expect(res.contentType).toBe('image/png');
+    });
+
+    it('proxifie le Bearer et accepte les types binaires', async () => {
+      const svc = createService();
+      nock(HOST, {
+        reqheaders: {
+          authorization: 'Bearer tok',
+          accept: /application\/pdf/,
+        },
+      })
+        .get('/api/v1/roomreservations/r1/confirmation-pdf')
+        .reply(200, Buffer.from('%PDF-1.7'), {
+          'Content-Type': 'application/pdf',
+        });
+
+      const res = await svc.getBinary('/roomreservations/r1/confirmation-pdf', {
+        bearerToken: 'tok',
+      });
+
+      expect(res.data.toString('latin1')).toBe('%PDF-1.7');
+    });
+
+    it('une 404 JSON du PMS devient une PmsRequestError lisible, jamais des octets', async () => {
+      const svc = createService();
+      nock(HOST)
+        .get('/api/v1/roomreservations/r1/confirmation-pdf')
+        .reply(
+          404,
+          { success: false, errors: ['Reservation not found'] },
+          { 'Content-Type': 'application/json' },
+        );
+
+      const err: unknown = await svc
+        .getBinary('/roomreservations/r1/confirmation-pdf')
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(PmsRequestError);
+      expect((err as PmsRequestError).status).toBe(404);
+      expect((err as PmsRequestError).errors).toEqual([
+        'Reservation not found',
+      ]);
+    });
+
+    it('rejoue une lecture binaire sur 5xx (lecture idempotente)', async () => {
+      const svc = createService();
+      nock(HOST)
+        .get('/api/v1/roomreservations/r1/confirmation-qr')
+        .reply(503)
+        .get('/api/v1/roomreservations/r1/confirmation-qr')
+        .reply(200, PNG, { 'Content-Type': 'image/png' });
+
+      const res = await svc.getBinary('/roomreservations/r1/confirmation-qr');
+
+      expect(res.data.equals(PNG)).toBe(true);
+    });
+
+    it('un 2xx sans Content-Type exploitable est une rupture de contrat (503)', async () => {
+      const svc = createService();
+      nock(HOST)
+        .get('/api/v1/roomreservations/r1/confirmation-qr')
+        .reply(200, { success: true, data: null });
+
+      await expect(
+        svc.getBinary('/roomreservations/r1/confirmation-qr'),
+      ).rejects.toBeInstanceOf(PmsUnavailableError);
+    });
+  });
 });

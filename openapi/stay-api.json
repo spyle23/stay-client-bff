@@ -117,7 +117,7 @@
           "AdminAnalytics"
         ],
         "summary": "Get Revenue By Region",
-        "description": "Gets revenue breakdown by country/region. Admin only.",
+        "description": "Gets the room-reservation revenue breakdown by country. One row per (country, hotel currency): amounts are expressed in the row's currency and never summed across currencies. Admin only.",
         "parameters": [
           {
             "name": "startDate",
@@ -952,7 +952,7 @@
           "Auth"
         ],
         "summary": "Get Current User",
-        "description": "Returns current user's profile.",
+        "description": "Returns the current user's identity: role, receptionist permissions (empty for other roles) and hotel.",
         "responses": {
           "200": {
             "description": "OK",
@@ -4107,7 +4107,7 @@
             }
           },
           "404": {
-            "description": "No active subscription",
+            "description": "Hotel not found, not owned by the caller, or no active subscription",
             "content": {
               "application/json": {
                 "schema": {
@@ -4354,6 +4354,16 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Hotel not found or not owned by the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrialEligibilityDtoApiResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -4409,7 +4419,7 @@
             }
           },
           "404": {
-            "description": "Hotel not found",
+            "description": "Hotel not found or not owned by the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -4427,7 +4437,7 @@
           "Payments"
         ],
         "summary": "Get Payment by ID",
-        "description": "Gets a payment by its ID.",
+        "description": "Gets a payment by its ID: paying Customer or Manager owning its hotel; anyone else gets 404.",
         "parameters": [
           {
             "name": "id",
@@ -4461,8 +4471,18 @@
               }
             }
           },
+          "403": {
+            "description": "Forbidden - Customer or Manager role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "Payment not found",
+            "description": "Payment not found or not concerning the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -4870,7 +4890,7 @@
         "tags": [
           "ReservationConfirmation"
         ],
-        "summary": "Confirms a reservation, triggering the \"confirmed\" event (email + attached PDF). Idempotent.",
+        "summary": "Confirms a reservation, capturing its held Stripe payment (#152) and triggering the \"confirmed\"\r\nevent (email + attached PDF). Idempotent.",
         "parameters": [
           {
             "name": "reservationId",
@@ -4916,6 +4936,16 @@
           },
           "404": {
             "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Bad Gateway",
             "content": {
               "application/json": {
                 "schema": {
@@ -5675,6 +5705,162 @@
           "403": {
             "description": "Forbidden",
             "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/RoomReservations/{id}/confirmation-pdf": {
+      "get": {
+        "tags": [
+          "RoomReservations"
+        ],
+        "summary": "Downloads the confirmation PDF of a confirmed reservation (#152, story 3.2 A6). Customer who owns\r\nthe reservation only; generated in memory, never stored.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The reservation identifier.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/RoomReservations/{id}/confirmation-qr": {
+      "get": {
+        "tags": [
+          "RoomReservations"
+        ],
+        "summary": "Renders the check-in QR code of a confirmed reservation as a PNG image (#152, story 3.2 A7).\r\nCustomer who owns the reservation only. The token itself never leaves the PMS: only its image.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The reservation identifier.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse"
@@ -6595,7 +6781,7 @@
           "StripeWebhook"
         ],
         "summary": "Test Payment Status Update",
-        "description": "Test endpoint to simulate webhook payment status update. For development/testing only.",
+        "description": "Simulates a webhook payment status update. Development environment only (404 elsewhere); Admin only.",
         "parameters": [
           {
             "name": "paymentIntentId",
@@ -6618,8 +6804,14 @@
           "200": {
             "description": "Payment status updated successfully"
           },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Not an Admin"
+          },
           "404": {
-            "description": "Payment not found"
+            "description": "Payment not found, or not the Development environment"
           }
         }
       }
@@ -7930,6 +8122,18 @@
           "role": {
             "$ref": "#/components/schemas/UserRole"
           },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          },
+          "hotelId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
           "accessToken": {
             "type": "string",
             "nullable": true
@@ -8122,6 +8326,21 @@
               "$ref": "#/components/schemas/ReservationServiceLineDto"
             },
             "nullable": true
+          },
+          "reservationCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "capturedAmount": {
+            "type": "number",
+            "format": "double"
+          },
+          "alreadyConfirmed": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -8500,22 +8719,42 @@
         "properties": {
           "userId": {
             "type": "string",
-            "description": "Gets or sets the user ID.",
             "format": "uuid"
           },
           "email": {
             "type": "string",
-            "description": "Gets or sets the email.",
+            "nullable": true
+          },
+          "firstName": {
+            "type": "string",
+            "nullable": true
+          },
+          "lastName": {
+            "type": "string",
             "nullable": true
           },
           "role": {
             "type": "string",
-            "description": "Gets or sets the role.",
+            "nullable": true
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          },
+          "hotelId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "hotelName": {
+            "type": "string",
             "nullable": true
           }
         },
-        "additionalProperties": false,
-        "description": "DTO for current user response."
+        "additionalProperties": false
       },
       "CurrentUserDtoApiResponse": {
         "type": "object",
@@ -9237,6 +9476,10 @@
           "price": {
             "type": "number",
             "format": "double"
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
           },
           "status": {
             "$ref": "#/components/schemas/SubscriptionStatus"
@@ -10695,6 +10938,10 @@
             "format": "double",
             "nullable": true
           },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
           "paymentMethod": {
             "$ref": "#/components/schemas/PaymentMethod"
           },
@@ -10850,6 +11097,10 @@
           "totalRevenue": {
             "type": "number",
             "format": "double"
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
           },
           "totalReservations": {
             "type": "integer",
@@ -11382,6 +11633,10 @@
             "type": "number",
             "format": "double"
           },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
           "services": {
             "type": "array",
             "items": {
@@ -11607,6 +11862,10 @@
           "price": {
             "type": "number",
             "format": "double"
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
           },
           "description": {
             "type": "string",

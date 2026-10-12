@@ -1,0 +1,627 @@
+import {
+  BadGatewayException,
+  ConflictException,
+  NotFoundException,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { Test, type TestingModule } from '@nestjs/testing';
+import type { Redis } from 'ioredis';
+import { FakeRedis } from '../../../test/fake-redis';
+import { CorrelationService } from '../../common/correlation/correlation.service';
+import type { RequestSession } from '../../common/decorators/current-session.decorator';
+import { PmsClientService } from '../../integration/pms/pms-client.service';
+import {
+  PmsRequestError,
+  PmsUnavailableError,
+} from '../../integration/pms/pms-errors';
+import {
+  SERVICE_KEY_TOKEN,
+  ServiceKeyProvider,
+} from '../../integration/pms/service-key.provider';
+import { RedisService } from '../../redis/redis.service';
+import { SessionService } from '../auth/session.service';
+import { toBookingException } from '../booking/booking-errors';
+import { BookingService } from '../booking/booking.service';
+import { CheckoutHoldService } from '../booking/checkout-hold.service';
+import type { BookingReservationDto } from '../booking/dto/reservation.dto';
+import {
+  CONFIRM_LOCK_KEY_PREFIX,
+  ConfirmationLockService,
+} from './confirmation-lock.service';
+import { PAYMENT_OPTIONS, type PaymentOptions } from './payment.constants';
+import { PaymentService } from './payment.service';
+
+const RESERVATION_ID = '11111111-1111-4111-8111-111111111111';
+const CONFIRM_PATH = `/reservations/${RESERVATION_ID}/confirm`;
+
+const session: RequestSession = {
+  sid: 'sid-1',
+  user: {
+    userId: 'user-1',
+    email: 'lea@example.com',
+    firstName: 'Léa',
+    lastName: 'Voyageuse',
+    role: 4,
+  },
+} as RequestSession;
+
+const options: PaymentOptions = {
+  confirmLockTtlMs: 60_000,
+  confirmWaitTimeoutMs: 2_000,
+  confirmPollIntervalMs: 10,
+};
+
+/** Réservation relue par `BookingService` (projection BFF, PII déjà écartée par la 2.4). */
+const reservation = (
+  overrides: Partial<BookingReservationDto> = {},
+): BookingReservationDto => ({
+  reservationId: RESERVATION_ID,
+  reservationCode: 'RES-20260901-A1B2C',
+  status: 'Pending',
+  hotelId: '22222222-2222-4222-8222-222222222222',
+  hotelName: 'Hôtel Colline',
+  roomId: '33333333-3333-4333-8333-333333333333',
+  roomNumber: '204',
+  roomCategory: 'Double Confort',
+  checkInDate: '2026-09-01',
+  checkOutDate: '2026-09-03',
+  nights: 2,
+  guests: 2,
+  currency: 'EUR',
+  pricePerNight: 8400,
+  total: 18_300,
+  roomTotal: 16_800,
+  servicesTotal: 1_500,
+  services: [
+    {
+      lineId: 'line-1',
+      serviceId: 'svc-1',
+      name: 'Petit-déjeuner',
+      unitPrice: 750,
+      quantity: 2,
+      lineTotal: 1_500,
+      serviceDate: '2026-09-02',
+      status: 'Pending',
+    },
+  ],
+  holdExpiresAt: '2026-09-01T10:00:00.000Z',
+  specialRequests: 'Chambre calme, allergie aux arachides',
+  communicationLocale: 'en',
+  communicationLocaleState: 'hotel_default_fallback',
+  created: false,
+  ...overrides,
+});
+
+/** Réponse PMS de la confirmation (#152) : montants en unités MAJEURES, devise en majuscules. */
+const pmsConfirmation = (overrides: Record<string, unknown> = {}) => ({
+  success: true,
+  data: {
+    reservationId: RESERVATION_ID,
+    grandTotal: 183,
+    droppedServices: [],
+    reservationCode: 'RES-20260901-A1B2C',
+    currency: 'EUR',
+    capturedAmount: 183,
+    alreadyConfirmed: false,
+    ...overrides,
+  },
+});
+
+/**
+ * Story 3.2 (B3 / B8) — `PaymentService.confirm`.
+ *
+ * Le verrou est le VRAI `ConfirmationLockService`, sur un faux Redis fidèle (`SET NX PX`,
+ * compare-and-delete, expiration) : un double permissif validerait un single-flight qui n'en est pas
+ * un (leçon 2.1).
+ */
+describe('PaymentService.confirm', () => {
+  let service: PaymentService;
+  let redis: FakeRedis;
+  let calls: string[];
+  let pms: { post: jest.Mock };
+  let booking: { getReservation: jest.Mock };
+  let holds: {
+    forget: jest.Mock;
+    release: jest.Mock;
+    markPaymentStarted: jest.Mock;
+    clearPaymentStarted: jest.Mock;
+  };
+
+  async function build(redisService: RedisService): Promise<void> {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        PaymentService,
+        ConfirmationLockService,
+        ServiceKeyProvider,
+        { provide: SERVICE_KEY_TOKEN, useValue: 'svc-key-test' },
+        { provide: PAYMENT_OPTIONS, useValue: options },
+        { provide: RedisService, useValue: redisService },
+        { provide: PmsClientService, useValue: pms },
+        {
+          provide: SessionService,
+          useValue: { withCustomerAuth: jest.fn() },
+        },
+        { provide: BookingService, useValue: booking },
+        { provide: CheckoutHoldService, useValue: holds },
+        {
+          provide: CorrelationService,
+          useValue: { getCorrelationId: () => 'corr-1' },
+        },
+      ],
+    }).compile();
+    service = module.get(PaymentService);
+  }
+
+  beforeEach(async () => {
+    calls = [];
+    redis = new FakeRedis();
+    pms = {
+      post: jest.fn((path: string) => {
+        calls.push(`pms.post ${path}`);
+        return Promise.resolve(pmsConfirmation());
+      }),
+    };
+    let confirmed = false;
+    pms.post.mockImplementation((path: string) => {
+      calls.push(`pms.post ${path}`);
+      confirmed = true;
+      return Promise.resolve(pmsConfirmation());
+    });
+    booking = {
+      getReservation: jest.fn(() => {
+        calls.push('booking.getReservation');
+        return Promise.resolve(
+          confirmed
+            ? reservation({
+                status: 'Confirmed',
+                services: [
+                  { ...reservation().services[0], status: 'Confirmed' },
+                ],
+              })
+            : reservation(),
+        );
+      }),
+    };
+    holds = {
+      forget: jest.fn(() => {
+        calls.push('holds.forget');
+        return Promise.resolve();
+      }),
+      release: jest.fn().mockResolvedValue(undefined),
+      markPaymentStarted: jest.fn().mockResolvedValue(undefined),
+      clearPaymentStarted: jest.fn().mockResolvedValue(undefined),
+    };
+    await build(new RedisService(redis as unknown as Redis));
+  });
+
+  describe('chemin nominal', () => {
+    it('relit, verrouille, confirme sous X-Service-Key, relit, puis oublie le hold — dans cet ordre', async () => {
+      await service.confirm(session, RESERVATION_ID);
+
+      expect(calls).toEqual([
+        'booking.getReservation',
+        `pms.post ${CONFIRM_PATH}`,
+        'booking.getReservation',
+        'holds.forget',
+      ]);
+    });
+
+    it('appelle le PMS avec la seule clé de service : ni Bearer, ni corps, clé d’idempotence stable', async () => {
+      await service.confirm(session, RESERVATION_ID);
+      await redis.del(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID);
+
+      const [path, body, ctx] = pms.post.mock.calls[0] as [
+        string,
+        unknown,
+        {
+          headers: Record<string, string>;
+          bearerToken?: string;
+          idempotencyKey: string;
+          maxRetries?: number;
+          correlationId?: string;
+        },
+      ];
+      expect(path).toBe(CONFIRM_PATH);
+      expect(body).toBeUndefined();
+      expect(ctx.headers['X-Service-Key']).toBe('svc-key-test');
+      expect(ctx.bearerToken).toBeUndefined();
+      expect(ctx.correlationId).toBe('corr-1');
+      // `maxRetries` par défaut : la route est idempotente par contrat PMS (#152).
+      expect(ctx.maxRetries).toBeUndefined();
+      expect(ctx.idempotencyKey).toMatch(/^[0-9a-f]{40}$/);
+      expect(ctx.idempotencyKey).not.toContain(RESERVATION_ID);
+    });
+
+    it('construit une preuve réduite : aucune PII, aucun jeton, montant capturé en unités mineures', async () => {
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      expect(proof).toEqual({
+        reservationId: RESERVATION_ID,
+        reservationCode: 'RES-20260901-A1B2C',
+        status: 'Confirmed',
+        hotelName: 'Hôtel Colline',
+        roomNumber: '204',
+        roomCategory: 'Double Confort',
+        checkInDate: '2026-09-01',
+        checkOutDate: '2026-09-03',
+        nights: 2,
+        guests: 2,
+        currency: 'EUR',
+        total: 18_300,
+        roomTotal: 16_800,
+        servicesTotal: 1_500,
+        services: [
+          expect.objectContaining({ serviceId: 'svc-1', status: 'Confirmed' }),
+        ],
+        capturedAmount: 18_300,
+        communicationLocale: 'en',
+        communicationLocaleState: 'hotel_default_fallback',
+        alreadyConfirmed: false,
+      });
+      const serialized = JSON.stringify(proof);
+      expect(serialized).not.toMatch(
+        /customerName|customerEmail|validationToken|specialRequests|arachides/,
+      );
+    });
+
+    it('rapporte alreadyConfirmed quand le PMS dit que la confirmation avait déjà eu lieu', async () => {
+      pms.post.mockResolvedValueOnce(
+        pmsConfirmation({ alreadyConfirmed: true }),
+      );
+
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      expect(proof.alreadyConfirmed).toBe(true);
+    });
+
+    it('libère le verrou après la confirmation', async () => {
+      await service.confirm(session, RESERVATION_ID);
+
+      expect(await redis.get(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID)).toBe(
+        null,
+      );
+    });
+
+    it('relecture finale en panne : preuve tirée de la première lecture et du résultat PMS', async () => {
+      booking.getReservation
+        .mockResolvedValueOnce(reservation())
+        .mockRejectedValueOnce(new PmsUnavailableError('down'));
+      pms.post.mockResolvedValueOnce(
+        pmsConfirmation({
+          grandTotal: 168,
+          capturedAmount: 168,
+          droppedServices: [{ id: 'line-1' }],
+        }),
+      );
+
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      // La confirmation a réussi : la perdre sur une simple relecture renverrait le voyageur
+      // réessayer une opération déjà faite.
+      expect(proof.status).toBe('Confirmed');
+      expect(proof.total).toBe(16_800);
+      expect(proof.servicesTotal).toBe(0);
+      expect(proof.services[0].status).toBe('Cancelled');
+      expect(proof.capturedAmount).toBe(16_800);
+    });
+
+    it('devise PMS divergente : capturé non affiché (null), jamais un montant dans la mauvaise devise', async () => {
+      pms.post.mockResolvedValueOnce(pmsConfirmation({ currency: 'CHF' }));
+
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      expect(proof.capturedAmount).toBeNull();
+      expect(proof.currency).toBe('EUR');
+    });
+  });
+
+  describe('chemin idempotent rapide (AC-2)', () => {
+    it.each(['Confirmed', 'CheckedIn', 'CheckedOut'] as const)(
+      'réservation déjà %s : preuve sans AUCUN appel au PMS, hold oublié',
+      async (status) => {
+        booking.getReservation.mockResolvedValue(reservation({ status }));
+
+        const proof = await service.confirm(session, RESERVATION_ID);
+
+        expect(pms.post).not.toHaveBeenCalled();
+        expect(holds.forget).toHaveBeenCalledWith(RESERVATION_ID);
+        expect(proof.alreadyConfirmed).toBe(true);
+        expect(proof.status).toBe(status);
+        // Non relu sur ce chemin : le front affiche le total, garanti égal au capturé par le PMS.
+        expect(proof.capturedAmount).toBeNull();
+        expect(proof.total).toBe(18_300);
+      },
+    );
+
+    it('ne prend pas le verrou sur le chemin rapide', async () => {
+      booking.getReservation.mockResolvedValue(
+        reservation({ status: 'Confirmed' }),
+      );
+      await redis.set(
+        CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID,
+        'autre',
+        'PX',
+        60_000,
+      );
+
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).resolves.toMatchObject({ alreadyConfirmed: true });
+    });
+  });
+
+  describe('single-flight (AC-3)', () => {
+    it('deux appels concurrents : UN seul POST de confirmation, la même preuve pour les deux', async () => {
+      let releasePms!: () => void;
+      const pmsGate = new Promise<void>((resolve) => {
+        releasePms = resolve;
+      });
+      let confirmed = false;
+      booking.getReservation.mockImplementation(() =>
+        Promise.resolve(
+          reservation({ status: confirmed ? 'Confirmed' : 'Pending' }),
+        ),
+      );
+      pms.post.mockImplementation(async () => {
+        await pmsGate;
+        confirmed = true;
+        return pmsConfirmation();
+      });
+
+      const first = service.confirm(session, RESERVATION_ID);
+      const second = service.confirm(session, RESERVATION_ID);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      releasePms();
+      const [a, b] = await Promise.all([first, second]);
+
+      expect(pms.post).toHaveBeenCalledTimes(1);
+      expect(a.reservationCode).toBe(b.reservationCode);
+      expect(a.total).toBe(b.total);
+      expect([a.alreadyConfirmed, b.alreadyConfirmed].sort()).toEqual([
+        false,
+        true,
+      ]);
+    });
+
+    it('le perdant reprend la main si le gagnant a échoué (réservation toujours Pending)', async () => {
+      await redis.set(
+        CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID,
+        'gagnant',
+        'PX',
+        60_000,
+      );
+      setTimeout(() => {
+        void redis.del(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID);
+      }, 30);
+
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      expect(pms.post).toHaveBeenCalledTimes(1);
+      expect(proof.alreadyConfirmed).toBe(false);
+    });
+
+    it('verrou toujours tenu au-delà de l’attente : 503 rejouable, aucun appel PMS', async () => {
+      await redis.set(
+        CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID,
+        'gagnant',
+        'PX',
+        60_000,
+      );
+
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(pms.post).not.toHaveBeenCalled();
+    }, 10_000);
+
+    it('panne Redis : 503, jamais 500, et aucun appel PMS', async () => {
+      await build(
+        new RedisService({
+          set: () => Promise.reject(new Error('ECONNREFUSED')),
+          get: () => Promise.reject(new Error('ECONNREFUSED')),
+          eval: () => Promise.reject(new Error('ECONNREFUSED')),
+        } as unknown as Redis),
+      );
+
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(pms.post).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('hold : forget après succès, jamais release, rien après échec (AC-5)', () => {
+    it('succès : forget, jamais release', async () => {
+      await service.confirm(session, RESERVATION_ID);
+
+      expect(holds.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      expect(holds.release).not.toHaveBeenCalled();
+    });
+
+    it('échec : ni forget ni release', async () => {
+      pms.post.mockRejectedValueOnce(
+        new PmsRequestError('x', 400, {
+          errors: ['Reservation payment is not authorized'],
+        }),
+      );
+
+      await expect(service.confirm(session, RESERVATION_ID)).rejects.toThrow();
+      expect(holds.forget).not.toHaveBeenCalled();
+      expect(holds.release).not.toHaveBeenCalled();
+    });
+
+    it('échec : le verrou est rendu (un nouvel essai peut partir)', async () => {
+      pms.post.mockRejectedValueOnce(
+        new PmsUnavailableError('down', undefined, {
+          status: 502,
+          body: { errors: ['Payment capture failed'] },
+        }),
+      );
+
+      await expect(service.confirm(session, RESERVATION_ID)).rejects.toThrow();
+      expect(await redis.get(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID)).toBe(
+        null,
+      );
+    });
+
+    it('forget en panne après une confirmation réussie : la preuve est quand même rendue', async () => {
+      holds.forget.mockRejectedValueOnce(new ServiceUnavailableException());
+
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).resolves.toMatchObject({ status: 'Confirmed' });
+    });
+  });
+
+  describe('motifs de refus (AC-6)', () => {
+    const reasonOf = async (): Promise<{ type: unknown; reason: unknown }> => {
+      const err: unknown = await service
+        .confirm(session, RESERVATION_ID)
+        .catch((e: unknown) => e);
+      const response = (
+        err as { getResponse?: () => { errors?: { reason?: string[] } } }
+      ).getResponse?.();
+      return { type: err, reason: response?.errors?.reason?.[0] };
+    };
+
+    it.each([
+      ['Reservation payment is not authorized', 'payment-not-authorized'],
+      ['Authorized amount does not match the amount due', 'amount-mismatch'],
+      [
+        'Cannot confirm a reservation in status Cancelled',
+        'reservation-cancelled',
+      ],
+    ])('400 « %s » → %s (409)', async (text, reason) => {
+      pms.post.mockRejectedValueOnce(
+        new PmsRequestError('x', 400, { errors: [text] }),
+      );
+
+      const { type, reason: actual } = await reasonOf();
+
+      expect(type).toBeInstanceOf(ConflictException);
+      expect(actual).toBe(reason);
+    });
+
+    it('502 « capture échouée » → capture-failed (502, rejouable)', async () => {
+      pms.post.mockRejectedValueOnce(
+        new PmsUnavailableError('down', undefined, {
+          status: 502,
+          body: { success: false, errors: ['Payment capture failed'] },
+        }),
+      );
+
+      const { type, reason } = await reasonOf();
+
+      expect(type).toBeInstanceOf(BadGatewayException);
+      expect(reason).toBe('capture-failed');
+    });
+
+    it('502 « autorisation expirée » → authorisation-expired (409, déterministe)', async () => {
+      pms.post.mockRejectedValueOnce(
+        new PmsUnavailableError('down', undefined, {
+          status: 502,
+          body: {
+            success: false,
+            errors: ['Payment authorisation has expired'],
+          },
+        }),
+      );
+
+      const { type, reason } = await reasonOf();
+
+      expect(type).toBeInstanceOf(ConflictException);
+      expect(reason).toBe('authorisation-expired');
+    });
+
+    it('404 du PMS → reservation-not-found', async () => {
+      pms.post.mockRejectedValueOnce(
+        new PmsRequestError('x', 404, { errors: ['Reservation not found'] }),
+      );
+
+      const { type, reason } = await reasonOf();
+
+      expect(type).toBeInstanceOf(NotFoundException);
+      expect(reason).toBe('reservation-not-found');
+    });
+
+    it('panne PMS sans motif → PmsUnavailableError (503 par le filtre global)', async () => {
+      pms.post.mockRejectedValueOnce(new PmsUnavailableError('down'));
+
+      const { type } = await reasonOf();
+
+      expect(type).toBeInstanceOf(PmsUnavailableError);
+    });
+
+    it('clé de service refusée (401) → 503, jamais « session expirée »', async () => {
+      pms.post.mockRejectedValueOnce(
+        new PmsRequestError('Unauthorized', 401, { errors: ['Invalid key'] }),
+      );
+
+      const { type, reason } = await reasonOf();
+
+      expect(type).toBeInstanceOf(ServiceUnavailableException);
+      expect(reason).toBeUndefined();
+    });
+
+    it('réservation d’un autre compte (404 à la relecture) → reservation-not-found, aucun appel PMS', async () => {
+      booking.getReservation.mockRejectedValueOnce(
+        toBookingException('room-not-found'),
+      );
+
+      const { type, reason } = await reasonOf();
+
+      expect(type).toBeInstanceOf(NotFoundException);
+      expect(reason).toBe('reservation-not-found');
+      expect(pms.post).not.toHaveBeenCalled();
+    });
+
+    it('session expirée à la relecture : 401 propagé tel quel', async () => {
+      booking.getReservation.mockRejectedValueOnce(
+        new UnauthorizedException('Session expirée.'),
+      );
+
+      const { type } = await reasonOf();
+
+      expect(type).toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('réservation annulée à la relecture : reservation-cancelled, aucun appel PMS', async () => {
+      booking.getReservation.mockResolvedValue(
+        reservation({ status: 'Cancelled' }),
+      );
+
+      const { type, reason } = await reasonOf();
+
+      expect(type).toBeInstanceOf(ConflictException);
+      expect(reason).toBe('reservation-cancelled');
+      expect(pms.post).not.toHaveBeenCalled();
+    });
+
+    it('contrat PMS rompu (2xx sans données) → 503', async () => {
+      pms.post.mockResolvedValueOnce({ success: true });
+
+      const { type } = await reasonOf();
+
+      expect(type).toBeInstanceOf(ServiceUnavailableException);
+    });
+  });
+
+  describe('D10 — langue de communication', () => {
+    it('reste en repli hotel_default_fallback : jamais « applied » tant que D10 n’est pas livrée', async () => {
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      expect(proof.communicationLocaleState).toBe('hotel_default_fallback');
+    });
+
+    it('une langue inconnue reste inconnue (null), sans valeur par défaut inventée', async () => {
+      booking.getReservation.mockResolvedValue(
+        reservation({ status: 'Confirmed', communicationLocale: null }),
+      );
+
+      const proof = await service.confirm(session, RESERVATION_ID);
+
+      expect(proof.communicationLocale).toBeNull();
+    });
+  });
+});

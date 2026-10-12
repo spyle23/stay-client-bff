@@ -63,6 +63,15 @@ export interface PmsRequestContext {
 }
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+/** Document binaire relayé tel quel (PDF, PNG) — story 3.2. */
+export interface PmsBinaryResponse {
+  data: Buffer;
+  contentType: string;
+}
+
+/** Types acceptés pour un document ; le JSON reste accepté pour lire une enveloppe d'erreur. */
+const BINARY_ACCEPT = 'application/pdf, image/png, application/json;q=0.5';
 const WRITE_METHODS: ReadonlySet<HttpMethod> = new Set<HttpMethod>([
   'POST',
   'PUT',
@@ -135,6 +144,32 @@ export class PmsClientService {
     return this.toApiResponse<T>(res);
   }
 
+  /**
+   * Lecture d'un **document binaire** (PDF, PNG) — story 3.2 (B1).
+   *
+   * ⚠️ Sur un non-2xx, le PMS répond une enveloppe **JSON** : elle est décodée et suit le chemin
+   * d'erreur normal (`PmsRequestError`), sinon une 404 métier remonterait au navigateur comme un
+   * « PDF corrompu ». Lecture idempotente : les retries par défaut s'appliquent.
+   */
+  async getBinary(
+    path: string,
+    ctx?: PmsRequestContext,
+  ): Promise<PmsBinaryResponse> {
+    const res = await this.request('GET', path, undefined, ctx, {
+      responseType: 'arraybuffer',
+      accept: BINARY_ACCEPT,
+    });
+    const contentType = headerValue(res.headers, 'content-type');
+    if (!contentType || /json/i.test(contentType)) {
+      // Un 2xx sans type exploitable (ou une enveloppe JSON) n'est pas un document : relayer ces
+      // octets ferait télécharger au voyageur un fichier illisible.
+      throw new PmsUnavailableError(
+        `Réponse PMS inattendue (document attendu, statut ${res.status}).`,
+      );
+    }
+    return { data: toBuffer(res.data), contentType };
+  }
+
   async getList<T>(
     path: string,
     ctx?: PmsRequestContext,
@@ -183,9 +218,14 @@ export class PmsClientService {
     path: string,
     body: unknown,
     ctx: PmsRequestContext = {},
+    binary?: { responseType: 'arraybuffer'; accept: string },
   ): Promise<AxiosResponse> {
     // Config construite UNE fois → l'Idempotency-Key reste stable sur toutes les tentatives de retry.
     const config = this.buildConfig(method, path, body, ctx);
+    if (binary) {
+      config.responseType = binary.responseType;
+      config.headers = { ...config.headers, Accept: binary.accept };
+    }
     try {
       return await this.breaker.fire(config, this.resolveMaxRetries(ctx));
     } catch (err) {
@@ -251,6 +291,8 @@ export class PmsClientService {
     maxRetries: number,
   ): Promise<AxiosResponse> {
     let lastCause: unknown;
+    // Dernier 5xx RÉPONDU (statut + corps) : la confirmation y porte un motif métier (#152).
+    let lastResponse: { status: number; body: unknown } | undefined;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
         await this.delay(this.backoffDelay(attempt));
@@ -262,6 +304,7 @@ export class PmsClientService {
       } catch (err) {
         // Erreur réseau / timeout → retryable.
         lastCause = err;
+        lastResponse = undefined;
         this.logger.warn(
           `PMS ${config.method ?? '?'} ${config.url ?? '?'} — échec réseau (tentative ${attempt + 1}/${maxRetries + 1})`,
         );
@@ -270,6 +313,7 @@ export class PmsClientService {
 
       if (res.status >= 500) {
         lastCause = new Error(`Le PMS a répondu ${res.status}`);
+        lastResponse = { status: res.status, body: decodeBody(res.data) };
         this.logger.warn(
           `PMS ${config.method ?? '?'} ${config.url ?? '?'} — ${res.status} (tentative ${attempt + 1}/${maxRetries + 1})`,
         );
@@ -287,6 +331,7 @@ export class PmsClientService {
     throw new PmsUnavailableError(
       'Le PMS ne répond pas après plusieurs tentatives.',
       lastCause,
+      lastResponse,
     );
   }
 
@@ -330,7 +375,8 @@ export class PmsClientService {
   }
 
   private toRequestError(res: AxiosResponse): PmsRequestError {
-    const body: unknown = res.data;
+    // Une lecture binaire reçoit ses erreurs en octets : on les décode avant d'y chercher l'enveloppe.
+    const body: unknown = decodeBody(res.data);
     let message = `Le PMS a renvoyé le statut ${res.status}.`;
     let errors: Record<string, string[]> | string[] | undefined;
 
@@ -367,4 +413,49 @@ export class PmsClientService {
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
+}
+
+/**
+ * Corps d'une réponse, décodé s'il est arrivé en octets (`responseType: 'arraybuffer'`) : une
+ * enveloppe JSON redevient un objet, tout autre contenu une chaîne. Les corps déjà décodés par
+ * axios passent inchangés.
+ */
+function decodeBody(data: unknown): unknown {
+  if (!Buffer.isBuffer(data) && !(data instanceof ArrayBuffer)) {
+    return data;
+  }
+  const text = toBuffer(data).toString('utf-8');
+  if (text.length === 0) {
+    return '';
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function toBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data);
+  }
+  if (typeof data === 'string') {
+    return Buffer.from(data, 'latin1');
+  }
+  return Buffer.alloc(0);
+}
+
+/** Valeur d'un en-tête de réponse axios, quelle que soit sa forme (objet brut ou `AxiosHeaders`). */
+function headerValue(headers: unknown, name: string): string | null {
+  if (headers === null || typeof headers !== 'object') {
+    return null;
+  }
+  const raw: unknown = (headers as Record<string, unknown>)[name];
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    return raw.trim();
+  }
+  return null;
 }

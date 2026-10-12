@@ -30,9 +30,27 @@ export class PmsRequestError extends Error {
 }
 
 export class PmsUnavailableError extends Error {
-  constructor(message: string, cause?: unknown) {
+  /**
+   * Statut du **dernier** 5xx reçu quand les retries sont épuisés sur des réponses (story 3.2) ;
+   * `undefined` pour une panne réseau, un timeout ou un circuit ouvert (rien n'a été répondu).
+   */
+  readonly status?: number;
+  /**
+   * Corps du dernier 5xx, pour les rares routes dont le 5xx porte un **motif métier** : la
+   * confirmation répond 502 « capture échouée » ou « autorisation expirée » (#152), deux issues
+   * différentes pour le voyageur. Jamais relayé tel quel au navigateur.
+   */
+  readonly responseBody?: unknown;
+
+  constructor(
+    message: string,
+    cause?: unknown,
+    lastResponse?: { status: number; body: unknown },
+  ) {
     // Chaîne l'erreur d'origine via le `cause` natif (Error.cause) plutôt que de le shadow.
     super(message, cause !== undefined ? { cause } : undefined);
     this.name = 'PmsUnavailableError';
+    this.status = lastResponse?.status;
+    this.responseBody = lastResponse?.body;
   }
 }
