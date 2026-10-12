@@ -492,6 +492,53 @@ describe('booking upsell (e2e — Redis réel + PMS mocké)', () => {
     expect(body.message).not.toContain('payment is already engaged');
   });
 
+  it('AC-6 : classe le gel sous la forme réelle du PMS (`errors` seul, `message` nul)', async () => {
+    // Corps produit par `ApiResponse.Fail` côté PMS : le motif vit dans `errors`, jamais dans
+    // `message` (piège vérifié en Phase 3 de la story 2.3).
+    nock(PMS_HOST)
+      .put(basketPath())
+      .reply(400, {
+        success: false,
+        data: null,
+        message: null,
+        errors: [
+          'Cannot modify services: a payment is already engaged for this reservation',
+        ],
+      });
+
+    const res = await request(app.getHttpServer())
+      .put(`/api/v1/booking/reservations/${reservationId}/services`)
+      .set('Cookie', cookie)
+      .send({
+        services: [{ serviceId, quantity: 1, serviceDate: SERVICE_DATE }],
+      })
+      .expect(409);
+
+    const body = res.body as ErrorEnvelope;
+    expect(body.errors?.reason).toEqual(['services-locked']);
+    expect(JSON.stringify(body)).not.toContain('payment is already engaged');
+  });
+
+  it('AC-5 : OMET la clé `services` sur un panier vide `[]`, jamais envoyé au PMS', async () => {
+    mockPrecheck();
+
+    let sentBody: Record<string, unknown> = {};
+    nock(PMS_HOST)
+      .post(createPath(), (body: Record<string, unknown>) => {
+        sentBody = body;
+        return true;
+      })
+      .reply(201, reservationBody(false));
+
+    await request(app.getHttpServer())
+      .post('/api/v1/booking/reservations')
+      .set('Cookie', cookie)
+      .send(createBody({ services: [] }))
+      .expect(201);
+
+    expect(sentBody).not.toHaveProperty('services');
+  });
+
   it('refuse la modification du panier sans session', async () => {
     await request(app.getHttpServer())
       .put(`/api/v1/booking/reservations/${reservationId}/services`)
