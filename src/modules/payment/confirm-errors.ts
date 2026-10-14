@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   BadGatewayException,
   BadRequestException,
@@ -29,11 +30,30 @@ import { assertPmsGuid, flattenPmsErrors } from '../booking/booking-errors';
  * motif se lit.
  */
 
-/** Chemin PMS de la confirmation — la SEULE route autorisée à porter `X-Service-Key` (AR-8). */
+/**
+ * Routes PMS de service, les SEULES autorisées à porter `X-Service-Key` (AR-8, liste blanche de
+ * `service-key-routes.ts`) : la confirmation, et les deux lectures de service de #153 qu'utilise la
+ * réconciliation (#5) sans session voyageur.
+ */
 export const PMS_CONFIRMATION_ENDPOINTS = {
   confirm: (reservationId: string) =>
     `/reservations/${assertPmsGuid(reservationId, 'reservationId')}/confirm`,
+  state: (reservationId: string) =>
+    `/reservations/${assertPmsGuid(reservationId, 'reservationId')}`,
+  payment: (reservationId: string) =>
+    `/reservations/${assertPmsGuid(reservationId, 'reservationId')}/payment`,
 } as const;
+
+/**
+ * Clé d'idempotence de la confirmation, **stable par réservation** et hachée (aucun identifiant en
+ * clair sur le fil). Partagée par le navigateur (#3) et la réconciliation (#5) : les deux chemins
+ * présentent au PMS la MÊME clé pour la même confirmation.
+ */
+export function confirmIdempotencyKey(reservationId: string): string {
+  return createHash('sha1')
+    .update(`reservation-confirm|${reservationId}`)
+    .digest('hex');
+}
 
 /**
  * Motif machine transmis au front dans `errors.reason`. Chaque valeur commande une **issue

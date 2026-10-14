@@ -24,6 +24,7 @@ import type {
 } from '../booking/dto/reservation.dto';
 import {
   classifyConfirmFailure,
+  confirmIdempotencyKey,
   PMS_CONFIRMATION_ENDPOINTS,
   toConfirmException,
 } from './confirm-errors';
@@ -37,6 +38,7 @@ import {
   toPaymentException,
 } from './payment-errors';
 import { PAYMENT_OPTIONS, type PaymentOptions } from './payment.constants';
+import { PaymentReconcileStore } from './reconcile.store';
 
 type PmsPaymentIntent = components['schemas']['PaymentIntentResultDto'];
 type PmsConfirmation = components['schemas']['ConfirmationResultDto'];
@@ -71,9 +73,10 @@ const BROKEN_CONTRACT_MESSAGE = 'Réponse inattendue du service de paiement.';
  * 3. **Contrôler le montant** contre le total réel de la réservation : c'est le BFF qui oppose au
  *    PMS un montant vérifié, jamais le navigateur (leçon de la boucle `price-changed` de la 2.4).
  *
- * ⚠️ **Hors périmètre, volontairement** : aucune capture, aucune confirmation, aucun job de
- * réconciliation. Sous capture manuelle (D8) les fonds sont seulement **retenus** ; l'encaissement
- * et la transition `Pending → Confirmed` appartiennent à la story 3.2, la réconciliation à la 3.4.
+ * Sous capture manuelle (D8) les fonds sont seulement **retenus** à l'autorisation ; l'encaissement
+ * et la transition `Pending → Confirmed` passent par `confirm` (story 3.2). Le job de réconciliation
+ * (`PaymentReconciler`, #5) rattrape les confirmations que le navigateur n'a jamais envoyées : ce
+ * service l'y inscrit à l'émission de l'intent et l'en retire à la confirmation.
  */
 @Injectable()
 export class PaymentService {
@@ -87,6 +90,7 @@ export class PaymentService {
     private readonly correlation: CorrelationService,
     private readonly serviceKey: ServiceKeyProvider,
     private readonly confirmLock: ConfirmationLockService,
+    private readonly reconcile: PaymentReconcileStore,
     @Inject(PAYMENT_OPTIONS) private readonly options: PaymentOptions,
   ) {}
 
@@ -127,6 +131,7 @@ export class PaymentService {
     // 2. Chemin idempotent rapide : rechargement, retour arrière, second onglet arrivé après coup.
     if (PAST_CONFIRMATION.has(reservation.status)) {
       await this.forgetHold(reservationId);
+      await this.forgetReconcile(reservationId);
       return toProof(reservation, {
         capturedAmount: null,
         alreadyConfirmed: true,
@@ -175,6 +180,7 @@ export class PaymentService {
         result,
       );
       await this.forgetHold(reservationId);
+      await this.forgetReconcile(reservationId);
       return proof;
     } finally {
       await this.confirmLock.release(reservationId, token);
@@ -237,7 +243,7 @@ export class PaymentService {
     try {
       ctx = this.serviceKey.confirmationContext(path, {
         ...this.pmsContext(),
-        idempotencyKey: this.confirmIdempotencyKey(reservationId),
+        idempotencyKey: confirmIdempotencyKey(reservationId),
       });
     } catch (err) {
       // Clé de service absente : configuration du BFF, pas une faute du voyageur → 503.
@@ -354,6 +360,23 @@ export class PaymentService {
     }
   }
 
+  /**
+   * Sort la réservation confirmée de l'index de réconciliation (#5, AC-1) : la passe suivante l'aurait
+   * fait en relisant `Confirmed`, autant lui épargner deux lectures PMS et Stripe.
+   *
+   * Best-effort, comme `forgetHold` : la confirmation est faite, et une panne Redis ici ne doit pas
+   * transformer une réussite en erreur.
+   */
+  private async forgetReconcile(reservationId: string): Promise<void> {
+    try {
+      await this.reconcile.remove(reservationId);
+    } catch {
+      this.logger.warn(
+        `Réservation ${reservationId} non retirée de l'index de réconciliation (la passe suivante la retirera).`,
+      );
+    }
+  }
+
   /** Attend la fin d'une confirmation en vol (verrou rendu ou expiré), au plus `confirmWaitTimeoutMs`. */
   private async waitForConfirmationInFlight(
     reservationId: string,
@@ -365,13 +388,6 @@ export class PaymentService {
         return;
       }
     }
-  }
-
-  /** Clé d'idempotence stable par réservation, hachée (aucun identifiant en clair sur le fil). */
-  private confirmIdempotencyKey(reservationId: string): string {
-    return createHash('sha1')
-      .update(`reservation-confirm|${reservationId}`)
-      .digest('hex');
   }
 
   /**
@@ -495,6 +511,11 @@ export class PaymentService {
     reservationId: string,
     dto: PaymentIntentDto,
   ): Promise<PaymentIntentDto> {
+    // Filet d'intégrité (#5, AC-1) : inscrit AVANT que le `clientSecret` ne parte, hors session et
+    // hors hold. Une autorisation est possible dès que le navigateur détient ce secret ; si la
+    // confirmation du navigateur n'arrive jamais (onglet fermé, BFF tombé), la réconciliation la
+    // rejouera. Panne Redis → 503 sans `clientSecret` : pas de paiement sans filet.
+    await this.reconcile.enroll(reservationId, Date.now());
     await this.holds.markIntentIssued(reservationId);
     return dto;
   }

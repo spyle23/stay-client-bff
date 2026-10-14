@@ -16,6 +16,11 @@ import {
   HOLD_INDEX_KEY,
   HOLD_KEY_PREFIX,
 } from '../src/modules/booking/checkout-hold.service';
+import {
+  RECONCILE_DUE_KEY,
+  RECONCILE_INDEX_KEY,
+  RECONCILE_KEY_PREFIX,
+} from '../src/modules/payment/reconcile.store';
 import { RedisService } from '../src/redis/redis.service';
 
 const PMS_HOST = 'http://pms.payment.local';
@@ -216,6 +221,10 @@ describe('payment/intent (e2e — Redis réel + PMS mocké)', () => {
     }
     await redis.del(HOLD_KEY_PREFIX + reservationId);
     await redis.raw.zrem(HOLD_INDEX_KEY, reservationId);
+    // Candidat de réconciliation inscrit par un intent réussi (#5) : jamais laissé dans le Redis partagé.
+    await redis.del(RECONCILE_KEY_PREFIX + reservationId);
+    await redis.raw.zrem(RECONCILE_INDEX_KEY, reservationId);
+    await redis.raw.zrem(RECONCILE_DUE_KEY, reservationId);
   });
 
   afterAll(async () => {
@@ -248,9 +257,46 @@ describe('payment/intent (e2e — Redis réel + PMS mocké)', () => {
         currency: 'EUR',
         captureMethod: 'manual',
       });
-      // Le paymentId du PMS reste côté serveur (il servira à la réconciliation, story 3.4).
+      // Le paymentId du PMS reste côté serveur (la réconciliation le relit par la route de service).
       expect(body.data).not.toHaveProperty('paymentId');
       expect(scope.isDone()).toBe(true);
+    });
+
+    it('#5 AC-1 : inscrit la réservation à la réconciliation, score = instant d’émission', async () => {
+      mockReservationRead();
+      await seedHold();
+      nock(PMS_HOST).post(intentPath()).reply(200, pmsIntentBody());
+      const before = Date.now();
+
+      await postIntent().expect(200);
+
+      const score = Number(
+        await redis.raw.zscore(RECONCILE_INDEX_KEY, reservationId),
+      );
+      expect(score).toBeGreaterThanOrEqual(before);
+      expect(score).toBeLessThanOrEqual(Date.now());
+      expect(
+        await redis.raw.zscore(RECONCILE_DUE_KEY, reservationId),
+      ).not.toBeNull();
+      // Indépendant de la session : l'état ne porte ni sid ni identifiant de compte.
+      const raw = await redis.get(RECONCILE_KEY_PREFIX + reservationId);
+      expect(raw).not.toBeNull();
+      expect(raw).not.toContain(openedSids[0]);
+      expect(raw).not.toContain(userId);
+    });
+
+    it('#5 AC-1 : aucun candidat quand l’intent est refusé', async () => {
+      mockReservationRead();
+      await seedHold();
+      nock(PMS_HOST)
+        .post(intentPath())
+        .reply(200, pmsIntentBody({ amountInCents: 16_801 }));
+
+      await postIntent().expect(409);
+
+      expect(
+        await redis.raw.zscore(RECONCILE_INDEX_KEY, reservationId),
+      ).toBeNull();
     });
 
     it('ne met jamais en cache une réponse porteuse d’un clientSecret', async () => {

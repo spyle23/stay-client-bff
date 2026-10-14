@@ -4954,7 +4954,126 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ServiceKey": [ ]
+          }
+        ]
+      }
+    },
+    "/api/v1/reservations/{reservationId}": {
+      "get": {
+        "tags": [
+          "ReservationState"
+        ],
+        "summary": "Reads a reservation: code, status, dates, amount due and hotel currency, without any personal\r\ndata nor validation token.",
+        "parameters": [
+          {
+            "name": "reservationId",
+            "in": "path",
+            "description": "The reservation identifier.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationStateDtoApiResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceKey": [ ]
+          }
+        ]
+      }
+    },
+    "/api/v1/reservations/{reservationId}/payment": {
+      "get": {
+        "tags": [
+          "ReservationState"
+        ],
+        "summary": "Reads the latest Stripe payment of a reservation, with its PaymentIntent as Stripe holds it now\r\n(amounts in minor units). `payment` is null without a Stripe payment; Stripe\r\nunreachable gives `stripeReadable = false`, never an error. Never the client secret nor the\r\nPaymentIntent id. Read-only.",
+        "parameters": [
+          {
+            "name": "reservationId",
+            "in": "path",
+            "description": "The reservation identifier.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationPaymentStateDtoApiResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceKey": [ ]
+          }
+        ]
       }
     },
     "/api/v1/reservations/validate": {
@@ -10372,6 +10491,53 @@
         "type": "integer",
         "format": "int32"
       },
+      "PaymentStateDto": {
+        "type": "object",
+        "properties": {
+          "paymentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PaymentStatus"
+          },
+          "amount": {
+            "type": "number",
+            "format": "double"
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "intentStatus": {
+            "type": "string",
+            "nullable": true
+          },
+          "amountCapturable": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "amountReceived": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "stripeReadable": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "paidAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
       "PaymentStatus": {
         "enum": [
           1,
@@ -10998,6 +11164,45 @@
         "type": "integer",
         "format": "int32"
       },
+      "ReservationPaymentStateDto": {
+        "type": "object",
+        "properties": {
+          "reservationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "payment": {
+            "$ref": "#/components/schemas/PaymentStateDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReservationPaymentStateDtoApiResponse": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "readOnly": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/ReservationPaymentStateDto"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true,
+            "readOnly": true
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true,
+            "readOnly": true
+          }
+        },
+        "additionalProperties": false
+      },
       "ReservationServiceLineDto": {
         "type": "object",
         "properties": {
@@ -11041,6 +11246,73 @@
           },
           "status": {
             "$ref": "#/components/schemas/ReservationStatus"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReservationStateDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reservationCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "$ref": "#/components/schemas/ReservationStatus"
+          },
+          "hotelId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "checkInDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "checkOutDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "grandTotal": {
+            "type": "number",
+            "format": "double"
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReservationStateDtoApiResponse": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "readOnly": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/ReservationStateDto"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true,
+            "readOnly": true
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true,
+            "readOnly": true
           }
         },
         "additionalProperties": false
@@ -12352,11 +12624,6 @@
           "description": {
             "type": "string",
             "nullable": true
-          },
-          "subscriptionId": {
-            "type": "string",
-            "format": "uuid",
-            "nullable": true
           }
         },
         "additionalProperties": false
@@ -12592,6 +12859,12 @@
         "description": "Enter your JWT token. Example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "ServiceKey": {
+        "type": "apiKey",
+        "description": "Service-to-service key (SERVICE_KEY), accepted on an explicit allow-list of routes only.",
+        "name": "X-Service-Key",
+        "in": "header"
       }
     }
   },

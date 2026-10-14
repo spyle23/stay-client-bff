@@ -273,26 +273,87 @@ describe('PmsClientService', () => {
       expect(nock.isDone()).toBe(true);
     });
 
-    it('refuse un X-Service-Key hors de la route /confirm (aucun HTTP émis)', async () => {
+    const RID = '3f2b8c1e-6d4a-4b7e-9a10-5c2d1e0f9a88';
+
+    it('refuse un X-Service-Key hors de la liste blanche (aucun HTTP émis)', async () => {
       const svc = createService();
+      // Aucun intercepteur nock : un appel émis échouerait en « Nock: No match », pas sur ce motif.
       await expect(
         svc.post('/hotels', {}, { headers: { 'X-Service-Key': 'k' } }),
       ).rejects.toThrow(/X-Service-Key/);
+      await expect(
+        svc.get(`/roomreservations/${RID}`, {
+          headers: { 'X-Service-Key': 'k' },
+        }),
+      ).rejects.toThrow(/X-Service-Key/);
+      await expect(
+        svc.get(`/payments/${RID}`, { headers: { 'X-Service-Key': 'k' } }),
+      ).rejects.toThrow(/X-Service-Key/);
     });
 
-    it('autorise X-Service-Key sur /reservations/{id}/confirm', async () => {
+    it('refuse un X-Service-Key sur une méthode non listée d’un chemin listé (#5 AC-7)', async () => {
+      const svc = createService();
+      await expect(
+        svc.delete(`/reservations/${RID}`, {
+          headers: { 'X-Service-Key': 'k' },
+        }),
+      ).rejects.toThrow(/X-Service-Key/);
+      await expect(
+        svc.get(`/reservations/${RID}/confirm`, {
+          headers: { 'X-Service-Key': 'k' },
+        }),
+      ).rejects.toThrow(/X-Service-Key/);
+      await expect(
+        svc.post(`/reservations/${RID}`, undefined, {
+          headers: { 'X-Service-Key': 'k' },
+        }),
+      ).rejects.toThrow(/X-Service-Key/);
+    });
+
+    it('reconnaît la clé quelle que soit la casse de l’en-tête (pas de contournement)', async () => {
+      const svc = createService();
+      await expect(
+        svc.get('/hotels', { headers: { 'x-service-key': 'k' } }),
+      ).rejects.toThrow(/X-Service-Key/);
+      await expect(
+        svc.get('/hotels', { headers: { 'X-SERVICE-KEY': 'k' } }),
+      ).rejects.toThrow(/X-Service-Key/);
+    });
+
+    it('autorise X-Service-Key sur POST /reservations/{id}/confirm', async () => {
       const svc = createService();
       nock(HOST, { reqheaders: { 'x-service-key': 'k' } })
-        .post('/api/v1/reservations/r1/confirm')
+        .post(`/api/v1/reservations/${RID}/confirm`)
         .reply(200, { success: true, data: { status: 'Confirmed' } });
 
       const res = await svc.post<{ status: string }>(
-        '/reservations/r1/confirm',
+        `/reservations/${RID}/confirm`,
         {},
         { headers: { 'X-Service-Key': 'k' } },
       );
 
       expect(res.data.status).toBe('Confirmed');
+      expect(nock.isDone()).toBe(true);
+    });
+
+    it('autorise X-Service-Key sur les deux lectures de service (#153)', async () => {
+      const svc = createService();
+      nock(HOST, { reqheaders: { 'x-service-key': 'k' } })
+        .get(`/api/v1/reservations/${RID}`)
+        .reply(200, { success: true, data: { status: 1 } })
+        .get(`/api/v1/reservations/${RID}/payment`)
+        .reply(200, { success: true, data: { payment: null } });
+
+      const state = await svc.get<{ status: number }>(`/reservations/${RID}`, {
+        headers: { 'X-Service-Key': 'k' },
+      });
+      const payment = await svc.get<{ payment: null }>(
+        `/reservations/${RID}/payment`,
+        { headers: { 'X-Service-Key': 'k' } },
+      );
+
+      expect(state.data.status).toBe(1);
+      expect(payment.data.payment).toBeNull();
       expect(nock.isDone()).toBe(true);
     });
   });

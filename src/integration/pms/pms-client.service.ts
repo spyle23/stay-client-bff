@@ -7,8 +7,8 @@ import axios, {
 } from 'axios';
 import CircuitBreaker from 'opossum';
 import type { ApiListResponse, ApiResponse } from './api-response.types';
-import { isConfirmationPath } from './confirm-path';
 import { PmsRequestError, PmsUnavailableError } from './pms-errors';
+import { isServiceKeyRoute } from './service-key-routes';
 
 /**
  * Client HTTP **résilient** BFF → PMS (Stay-api) — la frontière d'intégration (FR-21, AR-7).
@@ -20,7 +20,7 @@ import { PmsRequestError, PmsUnavailableError } from './pms-errors';
  * Frontière stricte : proxifie un `Bearer` `Customer` fourni par l'appelant, propage
  * `X-Correlation-ID`, pose une `Idempotency-Key` **stable** sur les écritures. N'accède
  * jamais à PostgreSQL et ne persiste aucune vérité métier (le PMS reste la source de vérité).
- * Le `X-Service-Key` n'est jamais posé ici : il transite via `ServiceKeyProvider` (route /confirm).
+ * Le `X-Service-Key` n'est jamais posé ici : il transite via `ServiceKeyProvider` (liste blanche).
  */
 
 export const PMS_CLIENT_OPTIONS = 'PMS_CLIENT_OPTIONS';
@@ -260,11 +260,12 @@ export class PmsClientService {
       headers['Idempotency-Key'] = ctx.idempotencyKey ?? randomUUID();
       headers['Content-Type'] = 'application/json';
     }
-    // Frontière AR-8 appliquée à l'envoi réel : X-Service-Key uniquement vers /confirm,
-    // quel que soit le chemin qui a produit l'en-tête (défense en profondeur).
-    if (headers['X-Service-Key'] !== undefined && !isConfirmationPath(path)) {
+    // Frontière AR-8 appliquée à l'envoi réel : X-Service-Key uniquement vers les routes de la liste
+    // blanche (méthode comprise, #5 AC-7), quel que soit le chemin qui a produit l'en-tête. Le nom
+    // d'en-tête est comparé sans casse : `x-service-key` ne doit pas contourner le contrôle.
+    if (hasServiceKeyHeader(headers) && !isServiceKeyRoute(method, path)) {
       throw new Error(
-        `X-Service-Key ne peut cibler que /reservations/{id}/confirm (reçu: "${path}").`,
+        `X-Service-Key interdit hors de la liste blanche des routes de service (reçu: ${method} "${path}").`,
       );
     }
     return { method, url: path, data: body, headers };
@@ -446,6 +447,13 @@ function toBuffer(data: unknown): Buffer {
     return Buffer.from(data, 'latin1');
   }
   return Buffer.alloc(0);
+}
+
+/** `true` si les en-têtes portent `X-Service-Key`, quelle qu'en soit la casse. */
+function hasServiceKeyHeader(headers: Record<string, string>): boolean {
+  return Object.keys(headers).some(
+    (name) => name.toLowerCase() === 'x-service-key',
+  );
 }
 
 /** Valeur d'un en-tête de réponse axios, quelle que soit sa forme (objet brut ou `AxiosHeaders`). */

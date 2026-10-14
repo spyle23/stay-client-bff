@@ -5,7 +5,13 @@ import { BookingModule } from '../booking/booking.module';
 import { ConfirmationLockService } from './confirmation-lock.service';
 import { PaymentController } from './payment.controller';
 import { PAYMENT_OPTIONS, resolvePaymentOptions } from './payment.constants';
+import { PaymentReconciler } from './payment-reconciler';
 import { PaymentService } from './payment.service';
+import {
+  RECONCILE_OPTIONS,
+  resolveReconcileOptions,
+} from './reconcile.constants';
+import { PaymentReconcileStore } from './reconcile.store';
 
 /**
  * Module `payment` — autorisation carte du tunnel (story 3.1, FR-12 / D8) et confirmation ferme
@@ -18,7 +24,9 @@ import { PaymentService } from './payment.service';
  * - `AuthModule` : `SessionService` (custody des jetons — seul chemin d'appel PMS authentifié) et
  *   `SessionGuard`.
  * - `PmsModule` : le client résilient (timeouts, breaker, correlation-id, `Idempotency-Key`) et
- *   `ServiceKeyProvider`, seul producteur de `X-Service-Key` (route de confirmation uniquement, AR-8).
+ *   `ServiceKeyProvider`, seul producteur de `X-Service-Key` (liste blanche de #153, AR-8).
+ * - Réconciliation (#5) : `PaymentReconcileStore` (index Redis des paiements émis) et
+ *   `PaymentReconciler` (job planifié qui rejoue la confirmation sous le même verrou que le navigateur).
  *
  * ⚠️ **Aucune dépendance vers le paquet `stripe`.** Le BFF ne parle jamais à Stripe : il passe par
  * le PMS, qui seul détient les clés secrètes (AR-14, PCI SAQ-A). Le paquet reste installé depuis le
@@ -33,6 +41,10 @@ import { PaymentService } from './payment.service';
     { provide: PAYMENT_OPTIONS, useFactory: () => resolvePaymentOptions() },
     PaymentService,
     ConfirmationLockService,
+    // Réconciliation paiement → confirmation (#5) : filet d'intégrité, hors session et hors hold.
+    { provide: RECONCILE_OPTIONS, useFactory: () => resolveReconcileOptions() },
+    PaymentReconcileStore,
+    PaymentReconciler,
   ],
   // Story 3.2 : le verrou de confirmation est partagé avec la réconciliation (#5).
   exports: [ConfirmationLockService],
