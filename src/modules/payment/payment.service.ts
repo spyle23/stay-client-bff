@@ -98,12 +98,14 @@ export class PaymentService {
    * L'ordre est l'invariant :
    * 1. relire la réservation **sous l'identité du voyageur** (propriété + statut) ;
    * 2. déjà confirmée → preuve depuis cette relecture, `forget`, **aucun** appel PMS ;
-   * 3. verrou single-flight Redis (deux onglets → un seul appel) ;
-   * 4. `POST /reservations/{id}/confirm` sous `X-Service-Key` (le PMS capture puis confirme) ;
-   * 5. succès → `holds.forget` (jamais `release`), preuve relue du serveur.
+   * 3. `Pending` sans paiement engagé (`paymentStarted` du hold) → 409, **aucun** appel PMS ;
+   * 4. verrou single-flight Redis (deux onglets → un seul appel) ;
+   * 5. `POST /reservations/{id}/confirm` sous `X-Service-Key` (le PMS capture puis confirme) ;
+   * 6. succès → `holds.forget` (jamais `release`), preuve relue du serveur.
    *
-   * ⚠️ Les remparts 1 à 3 sont du confort et de l'économie d'appels. Les garanties d'idempotence
-   * (une capture, une transition, un e-mail) sont celles du PMS (#152).
+   * ⚠️ Les remparts 1, 2 et 4 sont du confort et de l'économie d'appels. Les garanties
+   * d'idempotence (une capture, une transition, un e-mail) sont celles du PMS (#152). Le rempart 3,
+   * lui, est une **garantie** : le PMS confirme sans capture une réservation sans ligne `Payment`.
    */
   async confirm(
     session: RequestSession,
@@ -136,7 +138,16 @@ export class PaymentService {
       throw toConfirmException('rejected');
     }
 
-    // 3. Verrou single-flight. Une panne Redis remonte ici en 503 (jamais 500) et interrompt tout :
+    // 3. ⚠️ Paiement engagé exigé (revue ronde 1). Le PMS confirme SANS capture une réservation qui
+    //    n'a aucune ligne `Payment` (#152, chemin du back-office) ; or une réservation du tunnel n'en
+    //    a qu'une fois l'intent émis. Sans ce rempart, remplacer `/booking/payment` par
+    //    `/booking/confirmation` dans l'URL donnait une chambre `Confirmed` sans aucun débit.
+    //    `paymentStarted` est posé AVANT que le `clientSecret` ne quitte le BFF (3.1) : toute
+    //    autorisation possible le porte. Panne Redis → 503 (aucun appel PMS) ; un hold perdu après
+    //    autorisation reste rattrapable par la réconciliation (#5).
+    await this.assertPaymentStarted(reservationId);
+
+    // 4. Verrou single-flight. Une panne Redis remonte ici en 503 (jamais 500) et interrompt tout :
     //    aucun appel PMS ne part sans le verrou.
     const token = await this.confirmLock.acquire(reservationId);
     if (token === null) {
@@ -150,10 +161,10 @@ export class PaymentService {
     }
 
     try {
-      // 4. Confirmation PMS (capture comprise, #152).
+      // 5. Confirmation PMS (capture comprise, #152).
       const result = await this.requestPmsConfirmation(reservationId);
 
-      // 5. Preuve relue du serveur, puis le hold sort de l'index du balayeur.
+      // 6. Preuve relue du serveur, puis le hold sort de l'index du balayeur.
       const proof = await this.proofAfterConfirmation(
         session,
         reservation,
@@ -163,6 +174,23 @@ export class PaymentService {
       return proof;
     } finally {
       await this.confirmLock.release(reservationId, token);
+    }
+  }
+
+  /**
+   * Refuse (409 `payment-not-authorized`) une réservation `Pending` dont aucun paiement en ligne n'a
+   * été engagé par le tunnel : hold absent, ou présent sans `paymentStarted`.
+   *
+   * La lecture passe par `CheckoutHoldService`, dont toute panne Redis remonte en 503 : dans le
+   * doute, on ne confirme pas.
+   */
+  private async assertPaymentStarted(reservationId: string): Promise<void> {
+    const hold = await this.holds.read(reservationId);
+    if (hold?.paymentStarted !== true) {
+      this.logger.warn(
+        `Confirmation refusée pour la réservation ${reservationId} : aucun paiement engagé.`,
+      );
+      throw toConfirmException('payment-not-authorized');
     }
   }
 

@@ -23,7 +23,10 @@ import { RedisService } from '../../redis/redis.service';
 import { SessionService } from '../auth/session.service';
 import { toBookingException } from '../booking/booking-errors';
 import { BookingService } from '../booking/booking.service';
-import { CheckoutHoldService } from '../booking/checkout-hold.service';
+import {
+  type CheckoutHoldRecord,
+  CheckoutHoldService,
+} from '../booking/checkout-hold.service';
 import type { BookingReservationDto } from '../booking/dto/reservation.dto';
 import {
   CONFIRM_LOCK_KEY_PREFIX,
@@ -93,6 +96,22 @@ const reservation = (
   ...overrides,
 });
 
+/** Enregistrement de hold d'une réservation du tunnel dont le paiement est engagé (3.1). */
+const heldRecord = (
+  overrides: Partial<CheckoutHoldRecord> = {},
+): CheckoutHoldRecord => ({
+  reservationId: RESERVATION_ID,
+  sid: 'sid-1',
+  userId: 'user-1',
+  hotelId: '22222222-2222-4222-8222-222222222222',
+  roomId: '33333333-3333-4333-8333-333333333333',
+  expiresAt: Date.now() + 900_000,
+  stayKey: 'booking:idem:v1:stay',
+  paymentStarted: true,
+  attempts: 0,
+  ...overrides,
+});
+
 /** Réponse PMS de la confirmation (#152) : montants en unités MAJEURES, devise en majuscules. */
 const pmsConfirmation = (overrides: Record<string, unknown> = {}) => ({
   success: true,
@@ -122,6 +141,7 @@ describe('PaymentService.confirm', () => {
   let pms: { post: jest.Mock };
   let booking: { getReservation: jest.Mock };
   let holds: {
+    read: jest.Mock;
     forget: jest.Mock;
     release: jest.Mock;
     markPaymentStarted: jest.Mock;
@@ -184,6 +204,11 @@ describe('PaymentService.confirm', () => {
       }),
     };
     holds = {
+      // Hold du tunnel : paiement engagé (intent émis, story 3.1), seul cas confirmable.
+      read: jest.fn(() => {
+        calls.push('holds.read');
+        return Promise.resolve(heldRecord());
+      }),
       forget: jest.fn(() => {
         calls.push('holds.forget');
         return Promise.resolve();
@@ -196,11 +221,12 @@ describe('PaymentService.confirm', () => {
   });
 
   describe('chemin nominal', () => {
-    it('relit, verrouille, confirme sous X-Service-Key, relit, puis oublie le hold — dans cet ordre', async () => {
+    it('relit, vérifie le paiement engagé, confirme sous X-Service-Key, relit, oublie le hold', async () => {
       await service.confirm(session, RESERVATION_ID);
 
       expect(calls).toEqual([
         'booking.getReservation',
+        'holds.read',
         `pms.post ${CONFIRM_PATH}`,
         'booking.getReservation',
         'holds.forget',
@@ -428,6 +454,85 @@ describe('PaymentService.confirm', () => {
         service.confirm(session, RESERVATION_ID),
       ).rejects.toBeInstanceOf(ServiceUnavailableException);
       expect(pms.post).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('paiement engagé exigé (revue ronde 1 : jamais de chambre sans débit)', () => {
+    const refusal = async (): Promise<{ type: unknown; reason: unknown }> => {
+      const err: unknown = await service
+        .confirm(session, RESERVATION_ID)
+        .catch((e: unknown) => e);
+      const response = (
+        err as { getResponse?: () => { errors?: { reason?: string[] } } }
+      ).getResponse?.();
+      return { type: err, reason: response?.errors?.reason?.[0] };
+    };
+
+    it('lit le hold AVANT de prendre le verrou et d’appeler le PMS', async () => {
+      await service.confirm(session, RESERVATION_ID);
+
+      expect(calls.indexOf('holds.read')).toBeGreaterThan(
+        calls.indexOf('booking.getReservation'),
+      );
+      expect(calls.indexOf('holds.read')).toBeLessThan(
+        calls.indexOf(`pms.post ${CONFIRM_PATH}`),
+      );
+    });
+
+    it.each([
+      [
+        'hold sans paiement engagé (aucun intent émis)',
+        heldRecord({ paymentStarted: false }),
+      ],
+      ['hold absent (expiré, libéré ou jamais créé)', null],
+    ])(
+      'Pending + %s : 409 payment-not-authorized, aucun appel PMS, aucun verrou',
+      async (_label, hold) => {
+        holds.read.mockResolvedValue(hold);
+
+        const { type, reason } = await refusal();
+
+        expect(type).toBeInstanceOf(ConflictException);
+        expect(reason).toBe('payment-not-authorized');
+        expect(pms.post).not.toHaveBeenCalled();
+        expect(holds.forget).not.toHaveBeenCalled();
+        expect(
+          await redis.get(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID),
+        ).toBeNull();
+      },
+    );
+
+    it('panne Redis à la lecture du hold : 503, jamais une confirmation sans preuve de paiement', async () => {
+      holds.read.mockRejectedValue(new ServiceUnavailableException());
+
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(pms.post).not.toHaveBeenCalled();
+    });
+
+    it.each(['Confirmed', 'CheckedIn', 'CheckedOut'] as const)(
+      'déjà %s : la preuve est rendue même sans hold (rechargement après expiration)',
+      async (status) => {
+        booking.getReservation.mockResolvedValue(reservation({ status }));
+        holds.read.mockResolvedValue(null);
+
+        await expect(
+          service.confirm(session, RESERVATION_ID),
+        ).resolves.toMatchObject({ alreadyConfirmed: true });
+        expect(pms.post).not.toHaveBeenCalled();
+      },
+    );
+
+    it('annulée sans hold : reservation-cancelled reste le motif (statut d’abord)', async () => {
+      booking.getReservation.mockResolvedValue(
+        reservation({ status: 'Cancelled' }),
+      );
+      holds.read.mockResolvedValue(null);
+
+      const { reason } = await refusal();
+
+      expect(reason).toBe('reservation-cancelled');
     });
   });
 

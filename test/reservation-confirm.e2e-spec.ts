@@ -187,7 +187,8 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       });
   }
 
-  async function seedHold(): Promise<void> {
+  /** Hold du tunnel : par défaut, paiement engagé (intent émis, story 3.1). */
+  async function seedHold(paymentStarted = true): Promise<void> {
     const hold: CheckoutHoldRecord = {
       reservationId,
       sid: openedSids[0],
@@ -196,7 +197,7 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       roomId,
       expiresAt: Date.now() + 900_000,
       stayKey: `booking:idem:v1:${randomUUID()}`,
-      paymentStarted: true,
+      paymentStarted,
       attempts: 0,
     };
     await redis.set(
@@ -269,6 +270,8 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
     pmsStatus = 1;
     seen = [];
     cookie = await openSession(userId);
+    // Réservation du tunnel dont le paiement est engagé : seul cas confirmable (revue ronde 1).
+    await seedHold();
   });
 
   afterEach(async () => {
@@ -296,7 +299,6 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
     it('200 : preuve réduite, montant capturé relu, aucune PII', async () => {
       mockReads();
       const scope = mockConfirm();
-      await seedHold();
       await redis.set(COMM_LOCALE_KEY_PREFIX + reservationId, 'en', 3600);
 
       const response = await postConfirm().expect(200);
@@ -335,7 +337,6 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
     it('oublie le hold (index du balayeur) sans le libérer (enregistrement conservé)', async () => {
       mockReads();
       mockConfirm();
-      await seedHold();
       expect(await indexed()).toBe(true);
 
       await postConfirm().expect(200);
@@ -440,7 +441,6 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
 
     it('502 « capture échouée » après rejeux : motif capture-failed, hold toujours indexé', async () => {
       mockReads();
-      await seedHold();
       mockConfirm(
         () => [502, { success: false, errors: ['Payment capture failed'] }],
         3,
@@ -455,7 +455,7 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       expect(await indexed()).toBe(true);
     });
 
-    it('400 « paiement non autorisé » : 409 payment-not-authorized', async () => {
+    it('400 du PMS « paiement non autorisé » : 409 payment-not-authorized', async () => {
       mockReads();
       mockConfirm(() => [
         400,
@@ -468,6 +468,34 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
         'payment-not-authorized',
       ]);
     });
+
+    it.each([
+      ['hold sans paiement engagé (aucun intent émis)', 'unpaid'],
+      ['hold absent', 'missing'],
+    ])(
+      'Pending + %s : 409 payment-not-authorized, AUCUN POST /confirm au PMS',
+      async (_label, kind) => {
+        if (kind === 'unpaid') {
+          await seedHold(false);
+        } else {
+          await redis.del(HOLD_KEY_PREFIX + reservationId);
+          await redis.raw.zrem(HOLD_INDEX_KEY, reservationId);
+        }
+        mockReads();
+        const scope = mockConfirm();
+
+        const response = await postConfirm().expect(409);
+
+        expect((response.body as ErrorEnvelope).errors?.reason).toEqual([
+          'payment-not-authorized',
+        ]);
+        expect(scope.isDone()).toBe(false);
+        expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(0);
+        expect(
+          await redis.get(CONFIRM_LOCK_KEY_PREFIX + reservationId),
+        ).toBeNull();
+      },
+    );
 
     it('PMS en panne : 503 sans motif (le front propose de réessayer)', async () => {
       mockReads();
