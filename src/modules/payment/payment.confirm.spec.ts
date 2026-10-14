@@ -96,7 +96,10 @@ const reservation = (
   ...overrides,
 });
 
-/** Enregistrement de hold d'une réservation du tunnel dont le paiement est engagé (3.1). */
+/**
+ * Enregistrement de hold d'une réservation du tunnel dont l'intent a été émis : le PMS a créé la
+ * ligne `Payment` et le `clientSecret` est parti vers le navigateur (3.1, revue ronde 2).
+ */
 const heldRecord = (
   overrides: Partial<CheckoutHoldRecord> = {},
 ): CheckoutHoldRecord => ({
@@ -108,6 +111,7 @@ const heldRecord = (
   expiresAt: Date.now() + 900_000,
   stayKey: 'booking:idem:v1:stay',
   paymentStarted: true,
+  intentIssued: true,
   attempts: 0,
   ...overrides,
 });
@@ -482,7 +486,15 @@ describe('PaymentService.confirm', () => {
     it.each([
       [
         'hold sans paiement engagé (aucun intent émis)',
-        heldRecord({ paymentStarted: false }),
+        heldRecord({ paymentStarted: false, intentIssued: false }),
+      ],
+      [
+        'gel posé mais intent en échec (Stripe, circuit ouvert, timeout : aucune ligne Payment)',
+        heldRecord({ paymentStarted: true, intentIssued: false }),
+      ],
+      [
+        'gel posé, intentIssued absent (hold antérieur au correctif)',
+        heldRecord({ paymentStarted: true, intentIssued: undefined }),
       ],
       ['hold absent (expiré, libéré ou jamais créé)', null],
     ])(
@@ -501,6 +513,17 @@ describe('PaymentService.confirm', () => {
         ).toBeNull();
       },
     );
+
+    it('intent émis puis gel relâché par un refus ultérieur : la confirmation part (le paiement existe)', async () => {
+      holds.read.mockResolvedValue(
+        heldRecord({ paymentStarted: false, intentIssued: true }),
+      );
+
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).resolves.toMatchObject({ status: 'Confirmed' });
+      expect(pms.post).toHaveBeenCalledTimes(1);
+    });
 
     it('panne Redis à la lecture du hold : 503, jamais une confirmation sans preuve de paiement', async () => {
       holds.read.mockRejectedValue(new ServiceUnavailableException());

@@ -98,14 +98,16 @@ export class PaymentService {
    * L'ordre est l'invariant :
    * 1. relire la réservation **sous l'identité du voyageur** (propriété + statut) ;
    * 2. déjà confirmée → preuve depuis cette relecture, `forget`, **aucun** appel PMS ;
-   * 3. `Pending` sans paiement engagé (`paymentStarted` du hold) → 409, **aucun** appel PMS ;
+   * 3. `Pending` sans intent émis (`intentIssued` du hold) → 409, **aucun** appel PMS ;
    * 4. verrou single-flight Redis (deux onglets → un seul appel) ;
    * 5. `POST /reservations/{id}/confirm` sous `X-Service-Key` (le PMS capture puis confirme) ;
    * 6. succès → `holds.forget` (jamais `release`), preuve relue du serveur.
    *
    * ⚠️ Les remparts 1, 2 et 4 sont du confort et de l'économie d'appels. Les garanties
-   * d'idempotence (une capture, une transition, un e-mail) sont celles du PMS (#152). Le rempart 3,
-   * lui, est une **garantie** : le PMS confirme sans capture une réservation sans ligne `Payment`.
+   * d'idempotence (une capture, une transition, un e-mail) sont celles du PMS (#152). Le rempart 3
+   * est une **garantie** côté BFF : le PMS confirme sans capture une réservation sans ligne
+   * `Payment`, et `intentIssued` n'est posé qu'après sa création (le PMS ne la crée qu'après le
+   * succès de Stripe). Le refus côté PMS d'une telle confirmation est suivi par spyle23/hotelerie#182.
    */
   async confirm(
     session: RequestSession,
@@ -138,14 +140,16 @@ export class PaymentService {
       throw toConfirmException('rejected');
     }
 
-    // 3. ⚠️ Paiement engagé exigé (revue ronde 1). Le PMS confirme SANS capture une réservation qui
-    //    n'a aucune ligne `Payment` (#152, chemin du back-office) ; or une réservation du tunnel n'en
-    //    a qu'une fois l'intent émis. Sans ce rempart, remplacer `/booking/payment` par
-    //    `/booking/confirmation` dans l'URL donnait une chambre `Confirmed` sans aucun débit.
-    //    `paymentStarted` est posé AVANT que le `clientSecret` ne quitte le BFF (3.1) : toute
-    //    autorisation possible le porte. Panne Redis → 503 (aucun appel PMS) ; un hold perdu après
-    //    autorisation reste rattrapable par la réconciliation (#5).
-    await this.assertPaymentStarted(reservationId);
+    // 3. ⚠️ Intent émis exigé (revues rondes 1 et 2). Le PMS confirme SANS capture une réservation
+    //    qui n'a aucune ligne `Payment` (#152, chemin du back-office) ; or une réservation du tunnel
+    //    n'en a qu'une fois l'intent créé chez Stripe. Sans ce rempart, remplacer `/booking/payment`
+    //    par `/booking/confirmation` dans l'URL donnait une chambre `Confirmed` sans aucun débit.
+    //    `paymentStarted` ne suffit pas : posé AVANT l'appel d'intent, il survit à un intent en échec
+    //    (Stripe, circuit ouvert, timeout, 5xx). `intentIssued` n'est posé qu'après le succès du PMS,
+    //    juste avant que le `clientSecret` ne parte : une autorisation n'est possible qu'avec lui.
+    //    Panne Redis → 503 (aucun appel PMS) ; un hold perdu après autorisation reste rattrapable
+    //    par la réconciliation (#5).
+    await this.assertIntentIssued(reservationId);
 
     // 4. Verrou single-flight. Une panne Redis remonte ici en 503 (jamais 500) et interrompt tout :
     //    aucun appel PMS ne part sans le verrou.
@@ -178,17 +182,20 @@ export class PaymentService {
   }
 
   /**
-   * Refuse (409 `payment-not-authorized`) une réservation `Pending` dont aucun paiement en ligne n'a
-   * été engagé par le tunnel : hold absent, ou présent sans `paymentStarted`.
+   * Refuse (409 `payment-not-authorized`) une réservation `Pending` dont le tunnel n'a jamais émis
+   * d'intent : hold absent, ou présent sans `intentIssued` (gel posé mais intent en échec compris).
+   *
+   * `paymentStarted` n'est volontairement pas lu : il peut être vrai sans paiement (intent en échec)
+   * et faux avec un paiement (gel relâché par un refus postérieur à l'émission).
    *
    * La lecture passe par `CheckoutHoldService`, dont toute panne Redis remonte en 503 : dans le
    * doute, on ne confirme pas.
    */
-  private async assertPaymentStarted(reservationId: string): Promise<void> {
+  private async assertIntentIssued(reservationId: string): Promise<void> {
     const hold = await this.holds.read(reservationId);
-    if (hold?.paymentStarted !== true) {
+    if (hold?.intentIssued !== true) {
       this.logger.warn(
-        `Confirmation refusée pour la réservation ${reservationId} : aucun paiement engagé.`,
+        `Confirmation refusée pour la réservation ${reservationId} : aucun intent émis.`,
       );
       throw toConfirmException('payment-not-authorized');
     }
@@ -462,7 +469,8 @@ export class PaymentService {
       throw toPaymentException('amount-mismatch');
     }
 
-    return {
+    // 5. Seul ce chemin rend un `clientSecret` : l'émission est prouvée sur le hold juste avant.
+    return this.releaseIntent(reservationId, {
       clientSecret,
       publishableKey,
       paymentIntentId,
@@ -473,7 +481,22 @@ export class PaymentService {
       // front cesserait d'afficher « aucun débit ferme » au lieu de mentir (même règle que
       // `taxState` en 2.2 et `communicationLocaleState` en 2.5).
       captureMethod: intent.captureMethod === 'manual' ? 'manual' : 'automatic',
-    };
+    });
+  }
+
+  /**
+   * Projection rendue au navigateur, après avoir prouvé l'émission sur le hold (revue ronde 2).
+   *
+   * ⚠️ `markIntentIssued` vient APRÈS tous les contrôles (contrat, montant, devise) : un intent que
+   * le BFF refuse de rendre ne peut pas être autorisé, et ne doit pas ouvrir la confirmation. Une
+   * panne Redis ici remonte en 503 sans `clientSecret` ; l'intent du PMS reste réutilisable.
+   */
+  private async releaseIntent(
+    reservationId: string,
+    dto: PaymentIntentDto,
+  ): Promise<PaymentIntentDto> {
+    await this.holds.markIntentIssued(reservationId);
+    return dto;
   }
 
   /**

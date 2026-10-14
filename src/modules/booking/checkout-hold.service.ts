@@ -133,6 +133,23 @@ redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
 return 1`;
 
 /**
+ * Pose `intentIssued` **et** `paymentStarted` en un seul pas Redis (revue ronde 2 de #3).
+ *
+ * `intentIssued` prouve qu'un intent a réellement été émis par le PMS (ligne `Payment` créée) et que
+ * son `clientSecret` quitte le BFF. Le gel est reposé avec lui : un refus concurrent a pu le relâcher
+ * depuis la pose d'avant l'appel, et un `clientSecret` ne part jamais sur une chambre balayable.
+ * Mêmes codes de retour que la pose du gel.
+ */
+export const MARK_INTENT_ISSUED_SCRIPT = `local raw = redis.call('get', KEYS[1])
+if not raw then return 0 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok then return -1 end
+record.paymentStarted = true
+record.intentIssued = true
+redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
+return 1`;
+
+/**
  * Incrémente `attempts` **et** repousse le score d'index en un seul pas.
  *
  * Les deux vivaient dans deux appels distincts : un échec du second laissait le compteur
@@ -197,6 +214,13 @@ export interface CheckoutHoldRecord {
   stayKey: string;
   /** Posé par la story 3.1 dès qu'un paiement est engagé : le balayeur n'y touche plus (FR-14). */
   paymentStarted: boolean;
+  /**
+   * Posé quand le PMS a **réellement** émis l'intent et que son `clientSecret` quitte le BFF (revue
+   * ronde 2 de #3) : seule preuve qu'une ligne `Payment` existe côté PMS, exigée par la confirmation.
+   * `paymentStarted`, posé AVANT l'appel, survit à un intent en échec ; celui-ci, jamais.
+   * Absent sur un hold antérieur à ce champ : lu comme `false`.
+   */
+  intentIssued?: boolean;
   /** Nombre de passes de balayage infructueuses. */
   attempts: number;
 }
@@ -440,6 +464,33 @@ export class CheckoutHoldService {
   }
 
   /**
+   * Marque l'intent **émis** (revue ronde 2 de #3) : à appeler juste avant de rendre le
+   * `clientSecret`, jamais avant le succès de l'appel au PMS.
+   *
+   * Pose aussi le gel (voir `MARK_INTENT_ISSUED_SCRIPT`). Hold absent ou illisible : 503, et
+   * l'appelant ne rend pas le `clientSecret` (l'intent reste réutilisable par une relance).
+   */
+  async markIntentIssued(reservationId: string): Promise<void> {
+    const applied = await this.guard(() =>
+      this.redis.raw.eval(
+        MARK_INTENT_ISSUED_SCRIPT,
+        1,
+        HOLD_KEY_PREFIX + reservationId,
+        this.recordTtlSeconds,
+      ),
+    );
+    if (applied !== 1) {
+      this.logger.error(
+        `Émission d'intent non enregistrée pour la réservation ${reservationId} ` +
+          `(enregistrement de hold absent ou illisible).`,
+      );
+      throw new ServiceUnavailableException(
+        'Service de réservation momentanément indisponible.',
+      );
+    }
+  }
+
+  /**
    * Retire le drapeau `paymentStarted` — **uniquement** quand il est prouvé qu'aucun paiement ne
    * peut exister (revue de code 3.1).
    *
@@ -447,6 +498,8 @@ export class CheckoutHoldService {
    * déterministe du PMS — devise non encaissable, réservation plus en attente — laissait la chambre
    * immobilisée pour toujours, le balayeur ne touchant plus jamais un hold marqué. Le retrait suit
    * le même patron atomique que la pose : la modification s'exécute dans Redis.
+   *
+   * `intentIssued` n'est **jamais** retiré : un intent émis plus tôt garde sa ligne `Payment`.
    */
   async clearPaymentStarted(reservationId: string): Promise<void> {
     await this.guard(() =>
@@ -669,6 +722,7 @@ export class CheckoutHoldService {
       expiresAt: input.expiresAt,
       stayKey: this.idempotencyKey(input.stay),
       paymentStarted: false,
+      intentIssued: false,
       attempts: 0,
     };
   }

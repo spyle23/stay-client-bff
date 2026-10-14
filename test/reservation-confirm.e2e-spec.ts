@@ -187,8 +187,14 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       });
   }
 
-  /** Hold du tunnel : par défaut, paiement engagé (intent émis, story 3.1). */
-  async function seedHold(paymentStarted = true): Promise<void> {
+  /**
+   * Hold du tunnel : par défaut, intent émis (ligne `Payment` créée par le PMS, `clientSecret`
+   * rendu au navigateur : story 3.1, revue ronde 2).
+   */
+  async function seedHold(
+    paymentStarted = true,
+    intentIssued = paymentStarted,
+  ): Promise<void> {
     const hold: CheckoutHoldRecord = {
       reservationId,
       sid: openedSids[0],
@@ -198,6 +204,7 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       expiresAt: Date.now() + 900_000,
       stayKey: `booking:idem:v1:${randomUUID()}`,
       paymentStarted,
+      intentIssued,
       attempts: 0,
     };
     await redis.set(
@@ -504,6 +511,99 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       const response = await postConfirm().expect(503);
 
       expect((response.body as ErrorEnvelope).errors?.reason).toBeUndefined();
+    });
+  });
+
+  /**
+   * Revue ronde 2 (#3) : la chaîne réelle intent → confirmation, sur le même hold Redis.
+   *
+   * `paymentStarted` est posé AVANT l'appel d'intent ; un intent en échec le laisse donc en place,
+   * alors que le PMS n'a créé aucune ligne `Payment` (elle ne l'est qu'après le succès de Stripe).
+   * Sans preuve d'émission, `/booking/confirmation` saisi à la main confirmait SANS capture.
+   */
+  describe('intent puis confirmation (chaîne réelle, revue ronde 2)', () => {
+    const intentPath = () => `${PMS_PREFIX}/payments/room-reservation/intent`;
+
+    const postIntent = () =>
+      request(app.getHttpServer())
+        .post(`/api/v1/payment/reservations/${reservationId}/intent`)
+        .set('Cookie', cookie);
+
+    async function readHold(): Promise<CheckoutHoldRecord | null> {
+      const raw = await redis.get(HOLD_KEY_PREFIX + reservationId);
+      return raw ? (JSON.parse(raw) as CheckoutHoldRecord) : null;
+    }
+
+    beforeEach(async () => {
+      // Hold tel que la création de réservation le laisse : ni gel, ni intent.
+      await seedHold(false, false);
+    });
+
+    it.each([
+      [
+        '502 « Failed to create payment intent » (Stripe refuse)',
+        (scope: nock.Interceptor) =>
+          scope.reply(502, {
+            success: false,
+            errors: ['Failed to create payment intent'],
+          }),
+      ],
+      [
+        'coupure réseau avant toute réponse',
+        (scope: nock.Interceptor) => scope.replyWithError('ECONNRESET'),
+      ],
+    ])(
+      'intent en échec (%s) puis /confirm : 409, AUCUN POST /confirm au PMS',
+      async (_label, fail) => {
+        mockReads();
+        fail(nock(PMS_HOST).post(intentPath()));
+        const scope = mockConfirm();
+
+        await postIntent().expect(503);
+
+        // Le gel reste posé (le doute profite au paiement, FR-14) mais aucun intent n'est prouvé.
+        const hold = await readHold();
+        expect(hold?.paymentStarted).toBe(true);
+        expect(hold?.intentIssued).not.toBe(true);
+
+        const response = await postConfirm().expect(409);
+
+        expect((response.body as ErrorEnvelope).errors?.reason).toEqual([
+          'payment-not-authorized',
+        ]);
+        expect(scope.isDone()).toBe(false);
+        expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(0);
+        expect(
+          await redis.get(CONFIRM_LOCK_KEY_PREFIX + reservationId),
+        ).toBeNull();
+      },
+    );
+
+    it('intent émis puis /confirm : intentIssued posé, une seule confirmation PMS', async () => {
+      mockReads();
+      nock(PMS_HOST)
+        .post(intentPath())
+        .reply(200, {
+          success: true,
+          data: {
+            paymentId: randomUUID(),
+            clientSecret: 'fake-intent-client-secret',
+            paymentIntentId: 'fake-intent-id',
+            amountInCents: 16_800,
+            currency: 'eur',
+            publishableKey: 'fake-publishable-key',
+            captureMethod: 'manual',
+          },
+        });
+      const scope = mockConfirm();
+
+      await postIntent().expect(200);
+      expect((await readHold())?.intentIssued).toBe(true);
+
+      await postConfirm().expect(200);
+
+      expect(scope.isDone()).toBe(true);
+      expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(1);
     });
   });
 });
