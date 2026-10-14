@@ -185,6 +185,7 @@ describe('booking/reservations/:id/confirmation-pdf|qr (e2e)', () => {
     expect(response.headers['content-type']).toContain('image/png');
     expect(response.headers['content-disposition']).toBeUndefined();
     expect(response.headers['cache-control']).toBe('no-store, private');
+    expect(response.headers.vary).toContain('Cookie');
     expect(serviceKeys).toEqual([undefined]);
   });
 
