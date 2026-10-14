@@ -5,6 +5,7 @@ import {
   ConflictException,
   type HttpException,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import {
@@ -66,12 +67,42 @@ export type ConfirmFailureReason =
   | 'authorisation-expired'
   | 'reservation-not-found'
   | 'reservation-cancelled'
+  | 'room-unavailable'
   | 'not-owner'
   | 'session-invalid'
   | 'rejected';
 
 /** Clé du dictionnaire d'erreurs portant le motif machine (identique à `booking` et `payment`). */
 export const CONFIRM_REASON_KEY = 'reason';
+
+/**
+ * Clé du dictionnaire d'erreurs portant le **statut de débit** (#4, AC-8), lu au PMS :
+ * - `none` : aucun débit conservé (autorisation annulée, jamais capturée, ou aucun paiement) ;
+ * - `refunded` : remboursement intégral émis (AC-5) ;
+ * - `captured` : argent encaissé sans réservation confirmée ni remboursement (réservation annulée,
+ *   ou remboursement refusé par Stripe ; cas que la réconciliation signale en `integrity.alert`) :
+ *   l'écran ne doit surtout pas dire « aucun débit » ;
+ * - `held` : autorisation encore posée sur la carte, non encaissée (annulation refusée par Stripe).
+ * Absente quand le BFF ne l'a pas établi (lecture en échec, intent en cours) : l'écran n'en déduit
+ * JAMAIS « aucun débit » (revue #4, ronde 1), sauf pour un motif qui l'établit par construction.
+ */
+export const CONFIRM_DEBIT_KEY = 'debit';
+
+/** Statut de débit d'un échec de confirmation (#4, AC-8). */
+export type ConfirmDebitStatus = 'none' | 'refunded' | 'captured' | 'held';
+
+/**
+ * `ReservationErrors.PaymentReleaseFailed` (#4, 502) : la confirmation n'a pas abouti (chambre
+ * prise, réservation à annuler) et Stripe n'a pu ni annuler l'autorisation ni rembourser. Le PMS
+ * laisse la réservation telle quelle : le rejeu est sûr, ce n'est donc pas un refus définitif.
+ */
+const PAYMENT_RELEASE_FAILED =
+  /payment\s+of\s+this\s+reservation\s+could\s+not\s+be\s+released/i;
+
+/** Message BFF d'un paiement non libéré : générique, jamais le texte du PMS. */
+const RELEASE_FAILED_MESSAGE =
+  "La réservation n'a pas pu être finalisée et le paiement n'a pas encore été libéré : " +
+  'réessayez dans un instant.';
 
 /** Motifs textuels du PMS, dans l'ordre de spécificité. */
 const PMS_FAILURE_PATTERNS: ReadonlyArray<
@@ -87,6 +118,11 @@ const PMS_FAILURE_PATTERNS: ReadonlyArray<
   [
     /cannot\s+confirm\s+a\s+reservation\s+in\s+status\s+cancelled/i,
     'reservation-cancelled',
+  ],
+  // #4 AC-7 — `ReservationErrors.ConfirmRoomUnavailable` (409) : rien capturé, paiement libéré.
+  [
+    /room\s+is\s+no\s+longer\s+available\s+for\s+this\s+reservation/i,
+    'room-unavailable',
   ],
   [/not\s+authori[sz]ed\s+to\b/i, 'not-owner'],
   [/reservation\s+not\s+found/i, 'reservation-not-found'],
@@ -104,6 +140,8 @@ const REASON_MESSAGES: Record<ConfirmFailureReason, string> = {
     "L'autorisation de paiement a expiré. Aucun débit n'a été conservé.",
   'reservation-not-found': 'Réservation introuvable.',
   'reservation-cancelled': 'Cette réservation a été annulée.',
+  'room-unavailable':
+    "Cette chambre n'est plus disponible pour vos dates : la réservation n'a pas pu être confirmée.",
   'not-owner': 'Réservation introuvable.',
   'session-invalid': 'Session expirée. Identifiez-vous à nouveau.',
   rejected:
@@ -155,14 +193,46 @@ export function classifyConfirmFailure(
   );
 }
 
+/**
+ * Vrai pour le 502 « paiement non libéré » du PMS (#4). `classifyConfirmFailure` le laisse en panne
+ * (`null`) ; ce prédicat permet au service d'y joindre le statut de débit réel avant le 503.
+ */
+export function isPaymentReleaseFailure(err: unknown): boolean {
+  return (
+    err instanceof PmsUnavailableError &&
+    err.status === 502 &&
+    textsOf(err.responseBody).some((text) => PAYMENT_RELEASE_FAILED.test(text))
+  );
+}
+
+/**
+ * Paiement non libéré (#4, AC-8) : **503 rejouable** sans motif métier (l'écran propose
+ * « Réessayer »), avec le statut de débit lu au PMS quand il est établi (autorisation encore posée,
+ * montant encaissé…) pour que l'écran ne dise jamais « aucun débit » à tort.
+ */
+export function toReleaseFailedException(
+  debit?: ConfirmDebitStatus,
+): HttpException {
+  return new ServiceUnavailableException(
+    debit === undefined
+      ? { message: RELEASE_FAILED_MESSAGE }
+      : {
+          message: RELEASE_FAILED_MESSAGE,
+          errors: { [CONFIRM_DEBIT_KEY]: [debit] },
+        },
+  );
+}
+
 /** Traduit un motif en exception HTTP, motif machine inclus. */
 export function toConfirmException(
   reason: ConfirmFailureReason,
+  debit?: ConfirmDebitStatus,
 ): HttpException {
-  const body = {
-    message: REASON_MESSAGES[reason],
-    errors: { [CONFIRM_REASON_KEY]: [reason] },
-  };
+  const errors: Record<string, string[]> = { [CONFIRM_REASON_KEY]: [reason] };
+  if (debit !== undefined) {
+    errors[CONFIRM_DEBIT_KEY] = [debit];
+  }
+  const body = { message: REASON_MESSAGES[reason], errors };
 
   switch (reason) {
     // États serveur qui interdisent la confirmation : déterministes, réessayer ne changerait rien.
@@ -170,6 +240,7 @@ export function toConfirmException(
     case 'amount-mismatch':
     case 'authorisation-expired':
     case 'reservation-cancelled':
+    case 'room-unavailable':
       return new ConflictException(body);
     // L'échec vient de Stripe : rejouer la confirmation (idempotente) peut aboutir.
     case 'capture-failed':

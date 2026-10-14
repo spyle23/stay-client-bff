@@ -32,6 +32,52 @@ describe('resolveBookingOptions', () => {
     ).toBe(90);
   });
 
+  describe('fenêtre de paiement (#4, AC-2)', () => {
+    it('vaut 30 min par défaut', () => {
+      expect(resolveBookingOptions({}).paymentWindowSeconds).toBe(1_800);
+    });
+
+    it('borne la fenêtre entre 10 min et 2 h', () => {
+      expect(
+        resolveBookingOptions({
+          BOOKING_PAYMENT_WINDOW_SECONDS: '60',
+        }).paymentWindowSeconds,
+      ).toBe(600);
+      expect(
+        resolveBookingOptions({
+          BOOKING_PAYMENT_WINDOW_SECONDS: '99999',
+          BOOKING_HOLD_GRACE_SECONDS: '86400',
+        }).paymentWindowSeconds,
+      ).toBe(7_200);
+      expect(
+        resolveBookingOptions({ BOOKING_PAYMENT_WINDOW_SECONDS: 'abc' })
+          .paymentWindowSeconds,
+      ).toBe(1_800);
+    });
+
+    /**
+     * L'enregistrement de hold doit survivre à la fenêtre : sinon le balayeur trouverait un index
+     * sans données à l'échéance, et la `Pending` dont le formulaire a été abandonné resterait gelée.
+     */
+    it('refuse au boot une fenêtre plus longue que le sursis de l’enregistrement', () => {
+      expect(() =>
+        resolveBookingOptions({
+          BOOKING_PAYMENT_WINDOW_SECONDS: '3000',
+          BOOKING_HOLD_GRACE_SECONDS: '2000',
+        }),
+      ).toThrow(/BOOKING_PAYMENT_WINDOW_SECONDS/);
+    });
+
+    it('accepte une fenêtre égale au sursis', () => {
+      expect(
+        resolveBookingOptions({
+          BOOKING_PAYMENT_WINDOW_SECONDS: '2000',
+          BOOKING_HOLD_GRACE_SECONDS: '2000',
+        }).paymentWindowSeconds,
+      ).toBe(2_000);
+    });
+  });
+
   describe('hold de checkout et balayeur (story 2.4)', () => {
     it('applique les défauts documentés (hold 15 min, sursis 1 h)', () => {
       const options = resolveBookingOptions({});
@@ -47,10 +93,11 @@ describe('resolveBookingOptions', () => {
      * hold : un sursis nul rendrait toute annulation automatique impossible et gèlerait la chambre.
      */
     it('garantit un sursis strictement positif sur l’enregistrement', () => {
-      const options = resolveBookingOptions({
-        BOOKING_HOLD_GRACE_SECONDS: '0',
-      });
-      expect(options.holdRecordGraceSeconds).toBeGreaterThan(0);
+      // Depuis #4, un sursis sous la fenêtre de paiement minimale (600 s) est refusé au boot : le
+      // message prouve que le 0 a bien été ramené au plancher positif (300 s), jamais gardé tel quel.
+      expect(() =>
+        resolveBookingOptions({ BOOKING_HOLD_GRACE_SECONDS: '0' }),
+      ).toThrow(/BOOKING_HOLD_GRACE_SECONDS = 300\b/);
     });
 
     /**

@@ -433,6 +433,15 @@ describe('PaymentReconciler (#5)', () => {
       ],
       ['429 limiteur', new PmsRequestError('Too many', 429)],
       ['clé de service refusée', new PmsRequestError('Unauthorized', 401)],
+      [
+        'paiement non libéré chez Stripe (502, #4 AC-5)',
+        new PmsUnavailableError('502', undefined, {
+          status: 502,
+          body: {
+            errors: ['The payment of this reservation could not be released'],
+          },
+        }),
+      ],
     ])(
       'échec transitoire (%s) : retenté avec backoff, jamais retiré',
       async (_label, err) => {
@@ -447,6 +456,74 @@ describe('PaymentReconciler (#5)', () => {
         expect(nextAt).toBe(NOW + options.intervalMs);
       },
     );
+
+    /**
+     * #4 AC-5 : capturé mais non confirmable (chambre prise), et Stripe refuse le remboursement. Le
+     * PMS laisse la réservation en l'état (502) ; la réconciliation la retente et l'alerte de #5 le
+     * signale une fois le seuil dépassé.
+     */
+    it('#4 AC-5 : remboursement en échec au-delà du seuil → integrity.alert payment-not-confirmed', async () => {
+      const deps = makeDeps();
+      deps.setPayment(payment('succeeded'));
+      deps.entries.set(ID, {
+        record: record({
+          issuedAt: NOW - (options.alertAfterSeconds + 60) * 1000,
+          lastIntentStatus: 'succeeded',
+        }),
+        issuedAt: NOW - (options.alertAfterSeconds + 60) * 1000,
+      });
+      deps.pms.post.mockRejectedValueOnce(
+        new PmsUnavailableError('502', undefined, {
+          status: 502,
+          body: {
+            errors: ['The payment of this reservation could not be released'],
+          },
+        }),
+      );
+
+      await build(deps).reconcile();
+
+      expect(deps.store.remove).not.toHaveBeenCalled();
+      expect(alerts()).toEqual([
+        expect.objectContaining({
+          kind: 'payment-not-confirmed',
+          reservationId: ID,
+          intentStatus: 'succeeded',
+        }),
+      ]);
+    });
+
+    /**
+     * #4 AC-7 : le PMS a libéré le paiement et annulé la `Pending`. Ce n'est ni une panne (aucun
+     * backoff) ni un refus à mémoriser : la passe suivante relit `Cancelled` sans argent engagé et
+     * sort le candidat.
+     */
+    it('#4 AC-7 : chambre indisponible (409) → repassé à l’intervalle, puis sorti à la relecture', async () => {
+      const deps = makeDeps();
+      deps.pms.post.mockRejectedValueOnce(
+        new PmsRequestError('Conflict', 409, {
+          errors: ['Room is no longer available for this reservation'],
+        }),
+      );
+      const reconciler = build(deps);
+
+      await reconciler.reconcile();
+
+      const { rec, nextAt } = lastUpdate(deps);
+      expect(rec.failures).toBe(0);
+      expect(rec.refusal).toBeNull();
+      expect(nextAt).toBe(NOW + options.intervalMs);
+      expect(alerts()).toHaveLength(0);
+      expect(deps.store.remove).not.toHaveBeenCalled();
+
+      deps.entries.set(ID, { record: rec, issuedAt: NOW - 120_000 });
+      deps.setStatus(5);
+      deps.setPayment(payment('canceled'));
+      await reconciler.reconcile();
+
+      expect(deps.store.remove).toHaveBeenCalledWith(ID);
+      expect(deps.pms.post).toHaveBeenCalledTimes(1);
+    });
 
     it('échec de lecture transitoire : reporté, jamais retiré', async () => {
       const deps = makeDeps();
