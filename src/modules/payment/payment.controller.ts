@@ -15,12 +15,14 @@ import {
 } from '../../common/decorators/current-session.decorator';
 import { SessionGuard } from '../../common/guards/session.guard';
 import type { ApiResponse } from '../../integration/pms/api-response.types';
+import type { ConfirmationProofDto } from './dto/confirmation-proof.dto';
 import type { PaymentIntentDto } from './dto/payment-intent.dto';
 import { PaymentService } from './payment.service';
 
 /**
  * Frontière HTTP du domaine `payment` (story 3.1, FR-12) :
- * - `POST /api/v1/payment/reservations/:id/intent` — émet le PaymentIntent en **capture manuelle**.
+ * - `POST /api/v1/payment/reservations/:id/intent` — émet le PaymentIntent en **capture manuelle** ;
+ * - `POST /api/v1/payment/reservations/:id/confirm` — confirmation ferme et preuve (story 3.2).
  *
  * **Gardée** : c'est une écriture engageant l'argent du voyageur, et le PMS exige le JWT `Customer`.
  * Un 401 renvoie à l'étape d'identification, jamais vers une inscription (UX-DR-9.6).
@@ -56,6 +58,28 @@ export class PaymentController {
     return {
       success: true,
       data: await this.paymentService.createIntent(session, id),
+    };
+  }
+
+  /**
+   * Confirmation ferme post-paiement (story 3.2, FR-13) : le PMS capture la retenue puis confirme ;
+   * la réponse est la **preuve** (code, récapitulatif, montant encaissé), sans PII ni jeton.
+   *
+   * **200, jamais 201** — même raison qu'à l'intent : le BFF ignore si le PMS vient de confirmer ou
+   * rejoue une confirmation déjà faite (rechargement, second onglet).
+   */
+  @Post('reservations/:id/confirm')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(SessionGuard)
+  async confirm(
+    @CurrentSession() session: RequestSession,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiResponse<ConfirmationProofDto>> {
+    noStore(res);
+    return {
+      success: true,
+      data: await this.paymentService.confirm(session, id),
     };
   }
 }

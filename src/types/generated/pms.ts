@@ -177,7 +177,7 @@ export interface paths {
         };
         /**
          * Get Revenue By Region
-         * @description Gets revenue breakdown by country/region. Admin only.
+         * @description Gets the room-reservation revenue breakdown by country. One row per (country, hotel currency): amounts are expressed in the row's currency and never summed across currencies. Admin only.
          */
         get: {
             parameters: {
@@ -1037,7 +1037,7 @@ export interface paths {
         };
         /**
          * Get Current User
-         * @description Returns current user's profile.
+         * @description Returns the current user's identity: role, receptionist permissions (empty for other roles) and hotel.
          */
         get: {
             parameters: {
@@ -3880,7 +3880,7 @@ export interface paths {
                         "application/json": components["schemas"]["ApiResponse"];
                     };
                 };
-                /** @description No active subscription */
+                /** @description Hotel not found, not owned by the caller, or no active subscription */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -4119,6 +4119,15 @@ export interface paths {
                         "application/json": components["schemas"]["ApiResponse"];
                     };
                 };
+                /** @description Hotel not found or not owned by the caller */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TrialEligibilityDtoApiResponse"];
+                    };
+                };
             };
         };
         put?: never;
@@ -4179,7 +4188,7 @@ export interface paths {
                         "application/json": components["schemas"]["ApiResponse"];
                     };
                 };
-                /** @description Hotel not found */
+                /** @description Hotel not found or not owned by the caller */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -4207,7 +4216,7 @@ export interface paths {
         };
         /**
          * Get Payment by ID
-         * @description Gets a payment by its ID.
+         * @description Gets a payment by its ID: paying Customer or Manager owning its hotel; anyone else gets 404.
          */
         get: {
             parameters: {
@@ -4239,7 +4248,16 @@ export interface paths {
                         "application/json": components["schemas"]["ApiResponse"];
                     };
                 };
-                /** @description Payment not found */
+                /** @description Forbidden - Customer or Manager role required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Payment not found or not concerning the caller */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -4681,7 +4699,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Confirms a reservation, triggering the "confirmed" event (email + attached PDF). Idempotent. */
+        /**
+         * Confirms a reservation, capturing its held Stripe payment (#152) and triggering the "confirmed"
+         *     event (email + attached PDF). Idempotent.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -4723,6 +4744,15 @@ export interface paths {
                 };
                 /** @description Not Found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Bad Gateway */
+                502: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -5340,6 +5370,150 @@ export interface paths {
                 };
             };
         };
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/RoomReservations/{id}/confirmation-pdf": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Downloads the confirmation PDF of a confirmed reservation (#152, story 3.2 A6). Customer who owns
+         *     the reservation only; generated in memory, never stored.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description The reservation identifier. */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/pdf": string;
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/pdf": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/pdf": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Not Found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/pdf": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/RoomReservations/{id}/confirmation-qr": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Renders the check-in QR code of a confirmed reservation as a PNG image (#152, story 3.2 A7).
+         *     Customer who owns the reservation only. The token itself never leaves the PMS: only its image.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description The reservation identifier. */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "image/png": string;
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "image/png": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "image/png": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Not Found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "image/png": components["schemas"]["ApiResponse"];
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -6070,7 +6244,7 @@ export interface paths {
         put?: never;
         /**
          * Test Payment Status Update
-         * @description Test endpoint to simulate webhook payment status update. For development/testing only.
+         * @description Simulates a webhook payment status update. Development environment only (404 elsewhere); Admin only.
          */
         post: {
             parameters: {
@@ -6093,7 +6267,21 @@ export interface paths {
                     };
                     content?: never;
                 };
-                /** @description Payment not found */
+                /** @description Not authenticated */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Not an Admin */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Payment not found, or not the Development environment */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -7082,6 +7270,9 @@ export interface components {
             firstName?: string | null;
             lastName?: string | null;
             role?: components["schemas"]["UserRole"];
+            permissions?: string[] | null;
+            /** Format: uuid */
+            hotelId?: string | null;
             accessToken?: string | null;
             /** Format: date-time */
             accessTokenExpiration?: string;
@@ -7142,6 +7333,11 @@ export interface components {
             /** Format: double */
             grandTotal?: number;
             droppedServices?: components["schemas"]["ReservationServiceLineDto"][] | null;
+            reservationCode?: string | null;
+            currency?: string | null;
+            /** Format: double */
+            capturedAmount?: number;
+            alreadyConfirmed?: boolean;
         };
         ConfirmationResultDtoApiResponse: {
             readonly success?: boolean;
@@ -7261,17 +7457,17 @@ export interface components {
             /** Format: int32 */
             trialPeriodDays?: number | null;
         };
-        /** @description DTO for current user response. */
         CurrentUserDto: {
-            /**
-             * Format: uuid
-             * @description Gets or sets the user ID.
-             */
+            /** Format: uuid */
             userId?: string;
-            /** @description Gets or sets the email. */
             email?: string | null;
-            /** @description Gets or sets the role. */
+            firstName?: string | null;
+            lastName?: string | null;
             role?: string | null;
+            permissions?: string[] | null;
+            /** Format: uuid */
+            hotelId?: string | null;
+            hotelName?: string | null;
         };
         CurrentUserDtoApiResponse: {
             readonly success?: boolean;
@@ -7484,6 +7680,7 @@ export interface components {
             subscriptionName?: string | null;
             /** Format: double */
             price?: number;
+            currency?: string | null;
             status?: components["schemas"]["SubscriptionStatus"];
             isTrial?: boolean;
             /** Format: date-time */
@@ -7948,6 +8145,7 @@ export interface components {
             totalPrice?: number;
             /** Format: double */
             taxAmount?: number | null;
+            currency?: string | null;
             paymentMethod?: components["schemas"]["PaymentMethod"];
             status?: components["schemas"]["ReservationStatus"];
             source?: string | null;
@@ -8004,6 +8202,7 @@ export interface components {
             hotelCount?: number;
             /** Format: double */
             totalRevenue?: number;
+            currency?: string | null;
             /** Format: int32 */
             totalReservations?: number;
         };
@@ -8176,6 +8375,7 @@ export interface components {
             servicesTotal?: number;
             /** Format: double */
             grandTotal?: number;
+            currency?: string | null;
             services?: components["schemas"]["ReservationServiceLineDto"][] | null;
             /** Format: date-time */
             createdAt?: string;
@@ -8245,6 +8445,7 @@ export interface components {
             name?: string | null;
             /** Format: double */
             price?: number;
+            currency?: string | null;
             description?: string | null;
             /** Format: int32 */
             maxRooms?: number | null;

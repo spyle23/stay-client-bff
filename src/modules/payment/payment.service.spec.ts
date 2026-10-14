@@ -3,11 +3,17 @@ import { Test, type TestingModule } from '@nestjs/testing';
 import { CorrelationService } from '../../common/correlation/correlation.service';
 import type { RequestSession } from '../../common/decorators/current-session.decorator';
 import { PmsClientService } from '../../integration/pms/pms-client.service';
-import { PmsRequestError } from '../../integration/pms/pms-errors';
+import {
+  PmsRequestError,
+  PmsUnavailableError,
+} from '../../integration/pms/pms-errors';
 import { SessionService } from '../auth/session.service';
 import { BookingService } from '../booking/booking.service';
 import { CheckoutHoldService } from '../booking/checkout-hold.service';
 import type { BookingReservationDto } from '../booking/dto/reservation.dto';
+import { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
+import { ConfirmationLockService } from './confirmation-lock.service';
+import { PAYMENT_OPTIONS } from './payment.constants';
 import { PaymentService } from './payment.service';
 
 /**
@@ -23,6 +29,7 @@ describe('PaymentService', () => {
   let booking: { getReservation: jest.Mock };
   let holds: {
     markPaymentStarted: jest.Mock;
+    markIntentIssued: jest.Mock;
     clearPaymentStarted: jest.Mock;
   };
 
@@ -82,6 +89,7 @@ describe('PaymentService', () => {
     booking = { getReservation: jest.fn() };
     holds = {
       markPaymentStarted: jest.fn().mockResolvedValue(undefined),
+      markIntentIssued: jest.fn().mockResolvedValue(undefined),
       clearPaymentStarted: jest.fn().mockResolvedValue(undefined),
     };
 
@@ -96,6 +104,10 @@ describe('PaymentService', () => {
           provide: CorrelationService,
           useValue: { getCorrelationId: () => 'corr-1' },
         },
+        // Story 3.2 : dépendances de la confirmation, inertes pour l'intent.
+        { provide: ServiceKeyProvider, useValue: {} },
+        { provide: ConfirmationLockService, useValue: {} },
+        { provide: PAYMENT_OPTIONS, useValue: {} },
       ],
     }).compile();
 
@@ -206,6 +218,97 @@ describe('PaymentService', () => {
 
       // Émettre un intent que le balayeur peut encore annuler serait pire qu'un refus.
       expect(pms.post).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Revue ronde 2 (#3) : `paymentStarted` est posé AVANT l'appel au PMS, et un intent en échec le
+   * laisse en place sans qu'aucune ligne `Payment` n'existe côté PMS. La confirmation exige donc une
+   * preuve distincte, `intentIssued`, posée seulement quand un `clientSecret` quitte le BFF.
+   */
+  describe('revue ronde 2 — intentIssued posé seulement quand un clientSecret part', () => {
+    beforeEach(() => {
+      booking.getReservation.mockResolvedValue(pendingReservation());
+    });
+
+    it('pose intentIssued après l’intent du PMS et avant de rendre le clientSecret', async () => {
+      const order: string[] = [];
+      holds.markPaymentStarted.mockImplementation(() => {
+        order.push('mark');
+        return Promise.resolve();
+      });
+      pms.post.mockImplementation(() => {
+        order.push('pms');
+        return Promise.resolve(pmsIntent());
+      });
+      holds.markIntentIssued.mockImplementation(() => {
+        order.push('issued');
+        return Promise.resolve();
+      });
+
+      await service.createIntent(session, RESERVATION_ID);
+
+      expect(order).toEqual(['mark', 'pms', 'issued']);
+      expect(holds.markIntentIssued).toHaveBeenCalledWith(RESERVATION_ID);
+    });
+
+    it.each([
+      [
+        '502 du PMS (Stripe refuse la création)',
+        new PmsUnavailableError('PMS 502', undefined, {
+          status: 502,
+          body: { success: false, errors: ['Failed to create payment intent'] },
+        }),
+      ],
+      ['circuit ouvert', new PmsUnavailableError('Circuit PMS ouvert')],
+      [
+        'timeout',
+        new PmsUnavailableError('Délai dépassé', new Error('ETIMEDOUT')),
+      ],
+      [
+        'refus déterministe',
+        new PmsRequestError('Le PMS a renvoyé le statut 400', 400, {
+          errors: ['The hotel currency is not supported for card payment'],
+        }),
+      ],
+    ])(
+      'intent en échec (%s) : intentIssued n’est PAS posé',
+      async (_label, err) => {
+        pms.post.mockRejectedValue(err);
+
+        await expect(
+          service.createIntent(session, RESERVATION_ID),
+        ).rejects.toBeDefined();
+
+        expect(holds.markIntentIssued).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['montant divergent', { amountInCents: 9900 }],
+      ['contrat rompu (secret absent)', { clientSecret: null }],
+    ])(
+      '%s : aucun clientSecret ne part, intentIssued n’est PAS posé',
+      async (_label, overrides) => {
+        pms.post.mockResolvedValue(pmsIntent(overrides));
+
+        await expect(
+          service.createIntent(session, RESERVATION_ID),
+        ).rejects.toBeDefined();
+
+        expect(holds.markIntentIssued).not.toHaveBeenCalled();
+      },
+    );
+
+    it('pose impossible (Redis) : 503, aucun clientSecret rendu', async () => {
+      pms.post.mockResolvedValue(pmsIntent());
+      holds.markIntentIssued.mockRejectedValue(
+        new ServiceUnavailableException('Redis indisponible'),
+      );
+
+      await expect(
+        service.createIntent(session, RESERVATION_ID),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
     });
   });
 

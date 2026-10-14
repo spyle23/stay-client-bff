@@ -15,6 +15,7 @@ import {
   IDEMPOTENCY_KEY_PREFIX,
   INTENT_KEY_PREFIX,
   INTENT_MEMBER_PREFIX,
+  MARK_INTENT_ISSUED_SCRIPT,
   MARK_PAYMENT_STARTED_SCRIPT,
   PROMOTE_INTENT_SCRIPT,
   STAY_LOCK_PREFIX,
@@ -115,6 +116,23 @@ class ScriptedRedis extends FakeRedis {
           return -1;
         }
         record.paymentStarted = script === MARK_PAYMENT_STARTED_SCRIPT;
+        await super.set(keys[0], JSON.stringify(record), 'EX', Number(argv[0]));
+        return 1;
+      }
+      case MARK_INTENT_ISSUED_SCRIPT: {
+        // Mêmes codes de retour que la pose du gel ; les deux drapeaux sont posés ensemble.
+        const raw = await super.get(keys[0]);
+        if (raw === null) {
+          return 0;
+        }
+        let record: Record<string, unknown>;
+        try {
+          record = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          return -1;
+        }
+        record.paymentStarted = true;
+        record.intentIssued = true;
         await super.set(keys[0], JSON.stringify(record), 'EX', Number(argv[0]));
         return 1;
       }
@@ -460,6 +478,63 @@ describe('CheckoutHoldService', () => {
       },
     );
 
+    describe('intent émis (revue ronde 2 : preuve qu’un paiement existe côté PMS)', () => {
+      it('un hold neuf ne porte pas intentIssued, et le gel seul ne le pose pas', async () => {
+        expect((await service.read(RESERVATION_ID))?.intentIssued).toBe(false);
+
+        await service.markPaymentStarted(RESERVATION_ID);
+
+        expect((await service.read(RESERVATION_ID))?.intentIssued).toBe(false);
+      });
+
+      it('markIntentIssued pose intentIssued ET le gel, sans perdre le reste', async () => {
+        await service.markIntentIssued(RESERVATION_ID);
+
+        const record = await service.read(RESERVATION_ID);
+        expect(record?.intentIssued).toBe(true);
+        expect(record?.paymentStarted).toBe(true);
+        expect(record?.sid).toBe('sid-1');
+      });
+
+      it('rétablit le gel qu’un refus concurrent aurait relâché entre-temps (FR-14)', async () => {
+        await service.markPaymentStarted(RESERVATION_ID);
+        await service.clearPaymentStarted(RESERVATION_ID);
+
+        await service.markIntentIssued(RESERVATION_ID);
+
+        expect((await service.read(RESERVATION_ID))?.paymentStarted).toBe(true);
+      });
+
+      it('clearPaymentStarted ne retire jamais intentIssued (le paiement PMS existe)', async () => {
+        await service.markIntentIssued(RESERVATION_ID);
+
+        await service.clearPaymentStarted(RESERVATION_ID);
+
+        const record = await service.read(RESERVATION_ID);
+        expect(record?.paymentStarted).toBe(false);
+        expect(record?.intentIssued).toBe(true);
+      });
+
+      it('ÉCHOUE (503) quand le hold est absent ou illisible', async () => {
+        await redis.set(HOLD_KEY_PREFIX + 'corrompu', 'pas-du-json', 60);
+
+        await expect(
+          service.markIntentIssued('inconnu'),
+        ).rejects.toBeInstanceOf(ServiceUnavailableException);
+        await expect(
+          service.markIntentIssued('corrompu'),
+        ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      });
+
+      it('ne relit jamais l’enregistrement côté client (modification dans Redis)', async () => {
+        const get = jest.spyOn(redis, 'get');
+
+        await service.markIntentIssued(RESERVATION_ID);
+
+        expect(get).not.toHaveBeenCalledWith(HOLD_KEY_PREFIX + RESERVATION_ID);
+      });
+    });
+
     it('un report de tentative préserve un paiement déjà engagé', async () => {
       await service.markPaymentStarted(RESERVATION_ID);
       await service.reschedule(RESERVATION_ID, redis.now + 60_000);
@@ -680,6 +755,10 @@ describe('CheckoutHoldService', () => {
           }),
       ],
       ['dropIntent', (s: CheckoutHoldService) => s.dropIntent(INTENT_ID)],
+      [
+        'markIntentIssued',
+        (s: CheckoutHoldService) => s.markIntentIssued(RESERVATION_ID),
+      ],
       [
         'rescheduleIntent',
         (s: CheckoutHoldService) => s.rescheduleIntent(INTENT_ID, 1),

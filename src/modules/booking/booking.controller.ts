@@ -20,7 +20,7 @@ import {
 import { SessionGuard } from '../../common/guards/session.guard';
 import { RESERVATION_THROTTLE } from '../../common/throttler/throttler.constants';
 import type { ApiResponse } from '../../integration/pms/api-response.types';
-import { BookingService } from './booking.service';
+import { BookingService, type ConfirmationDocument } from './booking.service';
 import type { BookingQuoteDto } from './dto/booking-quote.dto';
 import { BookingQuoteQueryDto } from './dto/booking-quote.query.dto';
 import { CreateReservationRequestDto } from './dto/create-reservation.request.dto';
@@ -35,7 +35,8 @@ import { UpsellQueryDto } from './dto/upsell.query.dto';
  * Frontière HTTP du domaine `booking` (tunnel de réservation) :
  * - `GET  /api/v1/booking/quote` — devis du récapitulatif avant paiement (story 2.2, FR-7) ;
  * - `POST /api/v1/booking/reservations` — création de la Réservation `Pending` (story 2.4, FR-9) ;
- * - `GET  /api/v1/booking/reservations/:id` — reprise sans perte du tunnel (story 2.4, AC-9).
+ * - `GET  /api/v1/booking/reservations/:id` — reprise sans perte du tunnel (story 2.4, AC-9) ;
+ * - `GET  /api/v1/booking/reservations/:id/confirmation-pdf|qr` — documents de la preuve (story 3.2).
  *
  * **`/quote` est publique, volontairement non gardée.** L'identification est l'étape suivante et
  * l'inscription n'est **jamais** forcée avant de réserver (UX-DR-9.6, UX-DR-3.12) : exiger une
@@ -140,6 +141,40 @@ export class BookingController {
   }
 
   /**
+   * PDF de confirmation d'une réservation du voyageur (story 3.2, B6) — octets relayés intacts.
+   *
+   * Domaine « réservation » et non « paiement » : la story 4.3 (mes réservations) le réutilisera.
+   * Le navigateur l'obtient par `fetch` + cookie (origines distinctes :3001 → :4000), jamais par un
+   * lien direct qui partirait sans la session.
+   */
+  @Get('reservations/:id/confirmation-pdf')
+  @UseGuards(SessionGuard)
+  async getConfirmationPdf(
+    @CurrentSession() session: RequestSession,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    sendDocument(
+      res,
+      await this.bookingService.getConfirmationDocument(session, id, 'pdf'),
+    );
+  }
+
+  /** Image QR du jeton de check-in (story 3.2, B6) : seule l'image traverse, jamais le jeton. */
+  @Get('reservations/:id/confirmation-qr')
+  @UseGuards(SessionGuard)
+  async getConfirmationQr(
+    @CurrentSession() session: RequestSession,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    sendDocument(
+      res,
+      await this.bookingService.getConfirmationDocument(session, id, 'qr'),
+    );
+  }
+
+  /**
    * Relit une réservation du tunnel (reprise après rafraîchissement ou retour arrière).
    *
    * `ParseUUIDPipe` avant tout appel : un identifiant libre serait interpolé tel quel dans le
@@ -167,4 +202,20 @@ export class BookingController {
 function noStore(res: Response): void {
   res.setHeader('Cache-Control', 'no-store, private');
   res.setHeader('Vary', 'Cookie');
+}
+
+/**
+ * Envoie un document de confirmation : type relayé (déjà contrôlé par le service), `no-store`, et
+ * `Content-Disposition` **reconstruit par le BFF** — jamais l'en-tête amont tel quel.
+ */
+function sendDocument(res: Response, document: ConfirmationDocument): void {
+  noStore(res);
+  res.setHeader('Content-Type', document.contentType);
+  if (document.fileName !== null) {
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${document.fileName}"`,
+    );
+  }
+  res.status(HttpStatus.OK).send(document.data);
 }

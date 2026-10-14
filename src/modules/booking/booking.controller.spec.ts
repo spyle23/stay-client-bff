@@ -227,3 +227,98 @@ describe('BookingController — politique de débit de la création', () => {
     expect(ip?.()).toBe(resolveThrottlerOptions().ipLimit);
   });
 });
+
+/**
+ * Story 3.2 (B6) — proxys des documents de confirmation : octets intacts, `no-store`, et
+ * `Content-Disposition` reconstruit par le BFF.
+ */
+describe('BookingController — documents de confirmation', () => {
+  const RESERVATION_ID = '33333333-3333-4333-8333-333333333333';
+
+  function documentResponse() {
+    const headers = new Map<string, string>();
+    const res = {
+      setHeader: jest.fn((name: string, value: string) =>
+        headers.set(name, value),
+      ),
+      status: jest.fn(),
+      send: jest.fn(),
+    };
+    res.status.mockReturnValue(res);
+    return { res, headers };
+  }
+
+  it('PDF : octets intacts, type relayé, nom reconstruit, jamais mis en cache', async () => {
+    const pdf = Buffer.from('%PDF-1.7');
+    const getConfirmationDocument = jest.fn().mockResolvedValue({
+      data: pdf,
+      contentType: 'application/pdf',
+      fileName: 'RES-20260901-A1B2C.pdf',
+    });
+    const controller = new BookingController({
+      getConfirmationDocument,
+    } as unknown as BookingService);
+    const { res, headers } = documentResponse();
+
+    await controller.getConfirmationPdf(
+      SESSION,
+      RESERVATION_ID,
+      res as unknown as Response,
+    );
+
+    expect(getConfirmationDocument).toHaveBeenCalledWith(
+      SESSION,
+      RESERVATION_ID,
+      'pdf',
+    );
+    expect(res.status).toHaveBeenCalledWith(HttpStatus.OK);
+    expect(res.send).toHaveBeenCalledWith(pdf);
+    expect(headers.get('Content-Type')).toBe('application/pdf');
+    expect(headers.get('Content-Disposition')).toBe(
+      'attachment; filename="RES-20260901-A1B2C.pdf"',
+    );
+    expect(headers.get('Cache-Control')).toBe('no-store, private');
+    expect(headers.get('Vary')).toBe('Cookie');
+  });
+
+  it('QR : image relayée sans Content-Disposition', async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const controller = new BookingController({
+      getConfirmationDocument: jest.fn().mockResolvedValue({
+        data: png,
+        contentType: 'image/png',
+        fileName: null,
+      }),
+    } as unknown as BookingService);
+    const { res, headers } = documentResponse();
+
+    await controller.getConfirmationQr(
+      SESSION,
+      RESERVATION_ID,
+      res as unknown as Response,
+    );
+
+    expect(res.send).toHaveBeenCalledWith(png);
+    expect(headers.get('Content-Type')).toBe('image/png');
+    expect(headers.has('Content-Disposition')).toBe(false);
+    expect(headers.get('Cache-Control')).toBe('no-store, private');
+  });
+
+  it('un échec du service ne commence aucune réponse (le filtre global répond)', async () => {
+    const controller = new BookingController({
+      getConfirmationDocument: jest
+        .fn()
+        .mockRejectedValue(new Error('introuvable')),
+    } as unknown as BookingService);
+    const { res } = documentResponse();
+
+    await expect(
+      controller.getConfirmationQr(
+        SESSION,
+        RESERVATION_ID,
+        res as unknown as Response,
+      ),
+    ).rejects.toThrow('introuvable');
+    expect(res.send).not.toHaveBeenCalled();
+  });
+});

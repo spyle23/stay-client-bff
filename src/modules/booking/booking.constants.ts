@@ -247,7 +247,7 @@ export function resolveBookingOptions(
  * Le majorant est donc `timeout × (retries + 1) + base·(2^retries − 1) + base·retries` — soit
  * ≈ 25 s avec les défauts (8 s × 3 + 750 ms), valeur citée dans toute la documentation du module.
  */
-function resolvePmsCallBudgetMs(env: NodeJS.ProcessEnv): number {
+export function resolvePmsCallBudgetMs(env: NodeJS.ProcessEnv): number {
   // Mêmes règles de lecture que `resolvePmsClientOptions` : un timeout ≤ 0 est traité par axios
   // comme « aucun timeout » et retombe donc sur le défaut, pas sur un plancher arbitraire.
   const timeoutMs = positive(env.PMS_TIMEOUT_MS, 8_000);

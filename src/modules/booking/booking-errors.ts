@@ -73,6 +73,14 @@ export const PMS_RESERVATION_ENDPOINTS = {
   services: (reservationId: string) =>
     `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/services`,
   /**
+   * Documents de confirmation du voyageur (#152, story 3.2) : `[RequireRole(Customer)]`, 404 pour
+   * tout autre que le propriétaire d'une réservation `Confirmed`, générés en mémoire, `no-store`.
+   */
+  confirmationPdf: (reservationId: string) =>
+    `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/confirmation-pdf`,
+  confirmationQr: (reservationId: string) =>
+    `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/confirmation-qr`,
+  /**
    * Réservations du **compte courant** (`[RequireRole(Customer)]`, réponse paginée). Seul moyen,
    * pour le balayeur, de retrouver une `Pending` dont l'identifiant s'est perdu avec la réponse de
    * création (réconciliation des intentions — correctif D1).
