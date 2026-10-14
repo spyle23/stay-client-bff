@@ -15,6 +15,7 @@ import { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
 import { ConfirmationLockService } from './confirmation-lock.service';
 import { PAYMENT_OPTIONS } from './payment.constants';
 import { PaymentService } from './payment.service';
+import { PaymentReconcileStore } from './reconcile.store';
 
 /**
  * Story 3.1 — module `payment` du BFF.
@@ -32,6 +33,7 @@ describe('PaymentService', () => {
     markIntentIssued: jest.Mock;
     clearPaymentStarted: jest.Mock;
   };
+  let reconcile: { enroll: jest.Mock; remove: jest.Mock };
 
   const session: RequestSession = {
     sid: 'sid-1',
@@ -92,6 +94,10 @@ describe('PaymentService', () => {
       markIntentIssued: jest.fn().mockResolvedValue(undefined),
       clearPaymentStarted: jest.fn().mockResolvedValue(undefined),
     };
+    reconcile = {
+      enroll: jest.fn().mockResolvedValue(undefined),
+      remove: jest.fn().mockResolvedValue(undefined),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -108,6 +114,7 @@ describe('PaymentService', () => {
         { provide: ServiceKeyProvider, useValue: {} },
         { provide: ConfirmationLockService, useValue: {} },
         { provide: PAYMENT_OPTIONS, useValue: {} },
+        { provide: PaymentReconcileStore, useValue: reconcile },
       ],
     }).compile();
 
@@ -183,6 +190,62 @@ describe('PaymentService', () => {
 
       const [first, second] = idempotencyKeys();
       expect(first).not.toBe(second);
+    });
+  });
+
+  describe('#5 AC-1 — inscription à la réconciliation à l’émission de l’intent', () => {
+    beforeEach(() => {
+      booking.getReservation.mockResolvedValue(pendingReservation());
+      pms.post.mockResolvedValue(pmsIntent());
+    });
+
+    it('inscrit la réservation (instant d’émission) avant de rendre le clientSecret', async () => {
+      const before = Date.now();
+      const order: string[] = [];
+      pms.post.mockImplementation(() => {
+        order.push('pms');
+        return Promise.resolve(pmsIntent());
+      });
+      reconcile.enroll.mockImplementation(() => {
+        order.push('enroll');
+        return Promise.resolve();
+      });
+      holds.markIntentIssued.mockImplementation(() => {
+        order.push('markIntentIssued');
+        return Promise.resolve();
+      });
+
+      await service.createIntent(session, RESERVATION_ID);
+
+      expect(order).toEqual(['pms', 'enroll', 'markIntentIssued']);
+      const [id, issuedAt] = reconcile.enroll.mock.calls[0] as [string, number];
+      expect(id).toBe(RESERVATION_ID);
+      expect(issuedAt).toBeGreaterThanOrEqual(before);
+      expect(issuedAt).toBeLessThanOrEqual(Date.now());
+    });
+
+    it('l’inscription ne dépend ni de la session ni du hold (identifiant de réservation seul)', async () => {
+      await service.createIntent(session, RESERVATION_ID);
+      expect(reconcile.enroll.mock.calls[0]).toHaveLength(2);
+      expect(JSON.stringify(reconcile.enroll.mock.calls[0])).not.toContain(
+        session.sid,
+      );
+    });
+
+    it('panne Redis à l’inscription : 503, aucun clientSecret ne part sans filet', async () => {
+      reconcile.enroll.mockRejectedValueOnce(new ServiceUnavailableException());
+      await expect(
+        service.createIntent(session, RESERVATION_ID),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(holds.markIntentIssued).not.toHaveBeenCalled();
+    });
+
+    it('aucune inscription quand le PMS refuse l’intent ou que le montant diverge', async () => {
+      pms.post.mockResolvedValueOnce(pmsIntent({ amountInCents: 4501 }));
+      await expect(
+        service.createIntent(session, RESERVATION_ID),
+      ).rejects.toThrow();
+      expect(reconcile.enroll).not.toHaveBeenCalled();
     });
   });
 

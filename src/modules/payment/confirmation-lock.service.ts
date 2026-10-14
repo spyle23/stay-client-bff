@@ -22,8 +22,8 @@ export const CONFIRM_LOCK_KEY_PREFIX = 'payment:confirm:v1:';
  * ⚠️ C'est du **confort et de l'économie d'appels**, pas la garantie d'idempotence : celle-ci vient
  * du PMS (transition sous verrou de ligne, index unique de l'outbox, capture Stripe idempotente).
  *
- * Service **réutilisable** : la réconciliation (#5) prendra le même verrou, pour ne jamais rejouer
- * une confirmation pendant que le voyageur la déclenche.
+ * Service **partagé** : la réconciliation (#5, `PaymentReconciler`) prend le même verrou, pour ne
+ * jamais rejouer une confirmation pendant que le voyageur la déclenche.
  *
  * Panne Redis à la prise ou à la lecture → **503**, jamais 500 (règle 2.1). La libération est
  * best-effort : le TTL prend le relais.

@@ -34,6 +34,7 @@ import {
 } from './confirmation-lock.service';
 import { PAYMENT_OPTIONS, type PaymentOptions } from './payment.constants';
 import { PaymentService } from './payment.service';
+import { PaymentReconcileStore } from './reconcile.store';
 
 const RESERVATION_ID = '11111111-1111-4111-8111-111111111111';
 const CONFIRM_PATH = `/reservations/${RESERVATION_ID}/confirm`;
@@ -151,6 +152,7 @@ describe('PaymentService.confirm', () => {
     markPaymentStarted: jest.Mock;
     clearPaymentStarted: jest.Mock;
   };
+  let reconcile: { enroll: jest.Mock; remove: jest.Mock };
 
   async function build(redisService: RedisService): Promise<void> {
     const module: TestingModule = await Test.createTestingModule({
@@ -168,6 +170,7 @@ describe('PaymentService.confirm', () => {
         },
         { provide: BookingService, useValue: booking },
         { provide: CheckoutHoldService, useValue: holds },
+        { provide: PaymentReconcileStore, useValue: reconcile },
         {
           provide: CorrelationService,
           useValue: { getCorrelationId: () => 'corr-1' },
@@ -220,6 +223,10 @@ describe('PaymentService.confirm', () => {
       release: jest.fn().mockResolvedValue(undefined),
       markPaymentStarted: jest.fn().mockResolvedValue(undefined),
       clearPaymentStarted: jest.fn().mockResolvedValue(undefined),
+    };
+    reconcile = {
+      enroll: jest.fn().mockResolvedValue(undefined),
+      remove: jest.fn().mockResolvedValue(undefined),
     };
     await build(new RedisService(redis as unknown as Redis));
   });
@@ -596,6 +603,34 @@ describe('PaymentService.confirm', () => {
     it('forget en panne après une confirmation réussie : la preuve est quand même rendue', async () => {
       holds.forget.mockRejectedValueOnce(new ServiceUnavailableException());
 
+      await expect(
+        service.confirm(session, RESERVATION_ID),
+      ).resolves.toMatchObject({ status: 'Confirmed' });
+    });
+  });
+
+  describe('réconciliation (#5 AC-1) : la réservation confirmée sort de son index', () => {
+    it('après une confirmation réussie', async () => {
+      await service.confirm(session, RESERVATION_ID);
+      expect(reconcile.remove).toHaveBeenCalledWith(RESERVATION_ID);
+    });
+
+    it('sur le chemin idempotent rapide (déjà confirmée)', async () => {
+      booking.getReservation.mockResolvedValue(
+        reservation({ status: 'Confirmed' }),
+      );
+      await service.confirm(session, RESERVATION_ID);
+      expect(reconcile.remove).toHaveBeenCalledWith(RESERVATION_ID);
+    });
+
+    it('jamais après un échec : le filet reste tendu', async () => {
+      pms.post.mockRejectedValueOnce(new PmsUnavailableError('down'));
+      await expect(service.confirm(session, RESERVATION_ID)).rejects.toThrow();
+      expect(reconcile.remove).not.toHaveBeenCalled();
+    });
+
+    it('panne Redis au retrait : la preuve est quand même rendue', async () => {
+      reconcile.remove.mockRejectedValueOnce(new Error('ECONNREFUSED'));
       await expect(
         service.confirm(session, RESERVATION_ID),
       ).resolves.toMatchObject({ status: 'Confirmed' });
