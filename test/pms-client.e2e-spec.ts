@@ -88,12 +88,14 @@ describe('PmsModule (intégration — PMS mocké nock)', () => {
 
   it('confirme une réservation avec X-Service-Key sur la route /confirm', async () => {
     nock(HOST, { reqheaders: { 'x-service-key': 'itest-key' } })
-      .post('/api/v1/reservations/r1/confirm')
+      .post('/api/v1/reservations/3f2b8c1e-6d4a-4b7e-9a10-5c2d1e0f9a88/confirm')
       .reply(200, { success: true, data: { status: 'Confirmed' } });
 
-    const ctx = serviceKey.confirmationContext('/reservations/r1/confirm');
+    const ctx = serviceKey.confirmationContext(
+      '/reservations/3f2b8c1e-6d4a-4b7e-9a10-5c2d1e0f9a88/confirm',
+    );
     const res = await client.post<{ status: string }>(
-      '/reservations/r1/confirm',
+      '/reservations/3f2b8c1e-6d4a-4b7e-9a10-5c2d1e0f9a88/confirm',
       {},
       ctx,
     );

@@ -4768,6 +4768,128 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/reservations/{reservationId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Reads a reservation: code, status, dates, amount due and hotel currency, without any personal
+         *     data nor validation token.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description The reservation identifier. */
+                    reservationId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ReservationStateDtoApiResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Not Found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/reservations/{reservationId}/payment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Reads the latest Stripe payment of a reservation, with its PaymentIntent as Stripe holds it now
+         *     (amounts in minor units). `payment` is null without a Stripe payment; Stripe
+         *     unreachable gives `stripeReadable = false`, never an error. Never the client secret nor the
+         *     PaymentIntent id. Read-only.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description The reservation identifier. */
+                    reservationId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ReservationPaymentStateDtoApiResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Not Found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/reservations/validate": {
         parameters: {
             query?: never;
@@ -7965,6 +8087,24 @@ export interface components {
          * @enum {integer}
          */
         PaymentMethod: 1 | 2 | 3 | 4 | 5;
+        PaymentStateDto: {
+            /** Format: uuid */
+            paymentId?: string;
+            status?: components["schemas"]["PaymentStatus"];
+            /** Format: double */
+            amount?: number;
+            currency?: string | null;
+            intentStatus?: string | null;
+            /** Format: int64 */
+            amountCapturable?: number | null;
+            /** Format: int64 */
+            amountReceived?: number | null;
+            stripeReadable?: boolean;
+            /** Format: date-time */
+            createdAt?: string;
+            /** Format: date-time */
+            paidAt?: string | null;
+        };
         /**
          * Format: int32
          * @enum {integer}
@@ -8164,6 +8304,17 @@ export interface components {
          * @enum {integer}
          */
         ReservationEvent: 1 | 2 | 3;
+        ReservationPaymentStateDto: {
+            /** Format: uuid */
+            reservationId?: string;
+            payment?: components["schemas"]["PaymentStateDto"];
+        };
+        ReservationPaymentStateDtoApiResponse: {
+            readonly success?: boolean;
+            data?: components["schemas"]["ReservationPaymentStateDto"];
+            readonly message?: string | null;
+            readonly errors?: string[] | null;
+        };
         ReservationServiceLineDto: {
             /** Format: uuid */
             id?: string;
@@ -8183,6 +8334,29 @@ export interface components {
             /** Format: time */
             endTime?: string | null;
             status?: components["schemas"]["ReservationStatus"];
+        };
+        ReservationStateDto: {
+            /** Format: uuid */
+            id?: string;
+            reservationCode?: string | null;
+            status?: components["schemas"]["ReservationStatus"];
+            /** Format: uuid */
+            hotelId?: string;
+            /** Format: date-time */
+            checkInDate?: string;
+            /** Format: date-time */
+            checkOutDate?: string;
+            /** Format: double */
+            grandTotal?: number;
+            currency?: string | null;
+            /** Format: date-time */
+            createdAt?: string;
+        };
+        ReservationStateDtoApiResponse: {
+            readonly success?: boolean;
+            data?: components["schemas"]["ReservationStateDto"];
+            readonly message?: string | null;
+            readonly errors?: string[] | null;
         };
         /**
          * Format: int32
@@ -8593,8 +8767,6 @@ export interface components {
             currency?: string | null;
             locale?: string | null;
             description?: string | null;
-            /** Format: uuid */
-            subscriptionId?: string | null;
         };
         UpdateHotelServiceDto: {
             name?: string | null;
