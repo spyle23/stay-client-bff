@@ -90,6 +90,8 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
     `${PMS_PREFIX}/roomreservations/${reservationId}`;
   const confirmPath = () =>
     `${PMS_PREFIX}/reservations/${reservationId}/confirm`;
+  const paymentPath = () =>
+    `${PMS_PREFIX}/reservations/${reservationId}/payment`;
 
   /** Réservation de 2 nuits × 84 € = 168,00 €, statut piloté par `pmsStatus`. */
   const reservationBody = () => ({
@@ -476,33 +478,23 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
       ]);
     });
 
-    it.each([
-      ['hold sans paiement engagé (aucun intent émis)', 'unpaid'],
-      ['hold absent', 'missing'],
-    ])(
-      'Pending + %s : 409 payment-not-authorized, AUCUN POST /confirm au PMS',
-      async (_label, kind) => {
-        if (kind === 'unpaid') {
-          await seedHold(false);
-        } else {
-          await redis.del(HOLD_KEY_PREFIX + reservationId);
-          await redis.raw.zrem(HOLD_INDEX_KEY, reservationId);
-        }
-        mockReads();
-        const scope = mockConfirm();
+    it('Pending + hold sans paiement engagé (aucun intent émis) : 409, AUCUN appel PMS de paiement', async () => {
+      await seedHold(false);
+      mockReads();
+      const scope = mockConfirm();
 
-        const response = await postConfirm().expect(409);
+      const response = await postConfirm().expect(409);
 
-        expect((response.body as ErrorEnvelope).errors?.reason).toEqual([
-          'payment-not-authorized',
-        ]);
-        expect(scope.isDone()).toBe(false);
-        expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(0);
-        expect(
-          await redis.get(CONFIRM_LOCK_KEY_PREFIX + reservationId),
-        ).toBeNull();
-      },
-    );
+      expect((response.body as ErrorEnvelope).errors?.reason).toEqual([
+        'payment-not-authorized',
+      ]);
+      expect(scope.isDone()).toBe(false);
+      expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(0);
+      expect(seen.filter((c) => c.path === paymentPath())).toHaveLength(0);
+      expect(
+        await redis.get(CONFIRM_LOCK_KEY_PREFIX + reservationId),
+      ).toBeNull();
+    });
 
     it('PMS en panne : 503 sans motif (le front propose de réessayer)', async () => {
       mockReads();
@@ -512,6 +504,136 @@ describe('payment/confirm (e2e — Redis réel + PMS mocké)', () => {
 
       expect((response.body as ErrorEnvelope).errors?.reason).toBeUndefined();
     });
+  });
+
+  /**
+   * #183 — l'enregistrement de hold expire (TTL réel de Redis) alors que la carte est retenue :
+   * la confirmation s'appuie sur le paiement lu au PMS par la route de service (#153).
+   */
+  describe('hold expiré (#183)', () => {
+    const paymentBody = (
+      payment: Record<string, unknown> | null,
+    ): Record<string, unknown> => ({
+      success: true,
+      data: {
+        reservationId,
+        payment:
+          payment === null
+            ? null
+            : {
+                paymentId: randomUUID(),
+                amount: 168,
+                currency: 'EUR',
+                stripeReadable: true,
+                createdAt: new Date().toISOString(),
+                paidAt: null,
+                ...payment,
+              },
+      },
+    });
+
+    function mockPayment(reply: () => [number, unknown]): nock.Scope {
+      return nock(PMS_HOST)
+        .get(paymentPath())
+        .times(3)
+        .reply(function () {
+          record('GET', paymentPath(), this.req.headers);
+          return reply();
+        });
+    }
+
+    /** Hold réellement expiré par Redis (TTL court), index du balayeur déjà purgé. */
+    async function expireHold(): Promise<void> {
+      await redis.raw.pexpire(HOLD_KEY_PREFIX + reservationId, 30);
+      await redis.raw.zrem(HOLD_INDEX_KEY, reservationId);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(await redis.get(HOLD_KEY_PREFIX + reservationId)).toBeNull();
+    }
+
+    it.each([
+      ['carte retenue', 8, 'requires_capture'],
+      ['déjà encaissé', 3, 'succeeded'],
+    ])(
+      'AC-1 : %s → 200, UNE confirmation PMS, paiement lu sous X-Service-Key',
+      async (_label, status, intentStatus) => {
+        await expireHold();
+        mockReads();
+        mockPayment(() => [200, paymentBody({ status, intentStatus })]);
+        const scope = mockConfirm();
+
+        const response = await postConfirm().expect(200);
+
+        expect((response.body as ProofEnvelope).data.status).toBe('Confirmed');
+        expect(scope.isDone()).toBe(true);
+        expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(1);
+        const read = seen.find((c) => c.path === paymentPath());
+        expect(read?.serviceKey).toBe(SERVICE_KEY);
+        expect(read?.authorization).toBeUndefined();
+        expect(
+          await redis.get(CONFIRM_LOCK_KEY_PREFIX + reservationId),
+        ).toBeNull();
+      },
+    );
+
+    it('AC-1 : deux /confirm concurrents → un seul POST au PMS (même single-flight)', async () => {
+      await expireHold();
+      mockReads();
+      mockPayment(() => [
+        200,
+        paymentBody({ status: 8, intentStatus: 'requires_capture' }),
+      ]);
+      const scope = mockConfirm(undefined, 1, 150);
+
+      const [a, b] = await Promise.all([postConfirm(), postConfirm()]);
+
+      expect([a.status, b.status]).toEqual([200, 200]);
+      expect(scope.isDone()).toBe(true);
+      expect(seen.filter((c) => c.path === confirmPath())).toHaveLength(1);
+    });
+
+    it('aucune ligne Payment → 409 payment-not-authorized, AUCUN POST /confirm', async () => {
+      await expireHold();
+      mockReads();
+      mockPayment(() => [200, paymentBody(null)]);
+      const scope = mockConfirm();
+
+      const response = await postConfirm().expect(409);
+      const body = response.body as ErrorEnvelope;
+
+      expect(body.errors?.reason).toEqual(['payment-not-authorized']);
+      expect(body.errors?.debit).toEqual(['none']);
+      expect(scope.isDone()).toBe(false);
+    });
+
+    it.each([
+      ['PMS en panne sur la lecture', () => [503, { success: false }]],
+      [
+        'Stripe illisible',
+        () => [
+          200,
+          paymentBody({ status: 8, intentStatus: null, stripeReadable: false }),
+        ],
+      ],
+    ] as Array<[string, () => [number, unknown]]>)(
+      'AC-2 : %s → 503 payment-verification-pending, rejouable, AUCUN POST',
+      async (_label, reply) => {
+        await expireHold();
+        mockReads();
+        mockPayment(reply);
+        const scope = mockConfirm();
+
+        const response = await postConfirm().expect(503);
+        const body = response.body as ErrorEnvelope;
+
+        expect(body.errors?.reason).toEqual(['payment-verification-pending']);
+        expect(body.errors).not.toHaveProperty('debit');
+        expect(body.message).not.toMatch(/autorisé|aucun débit/i);
+        expect(scope.isDone()).toBe(false);
+        expect(
+          await redis.get(CONFIRM_LOCK_KEY_PREFIX + reservationId),
+        ).toBeNull();
+      },
+    );
   });
 
   /**

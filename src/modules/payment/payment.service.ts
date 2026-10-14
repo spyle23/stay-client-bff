@@ -129,7 +129,9 @@ export class PaymentService {
    * L'ordre est l'invariant :
    * 1. relire la réservation **sous l'identité du voyageur** (propriété + statut) ;
    * 2. déjà confirmée → preuve depuis cette relecture, `forget`, **aucun** appel PMS ;
-   * 3. `Pending` sans intent émis (`intentIssued` du hold) → 409, **aucun** appel PMS ;
+   * 3. `Pending` sans intent émis (`intentIssued` du hold) → 409, **aucun** appel PMS ; hold absent
+   *    ou expiré (#183) → paiement lu au PMS : engagé, on poursuit ; absent, 409 ; non établi, 503
+   *    rejouable `payment-verification-pending` ;
    * 4. verrou single-flight Redis (deux onglets → un seul appel) ;
    * 5. `POST /reservations/{id}/confirm` sous `X-Service-Key` (le PMS capture puis confirme) ;
    * 6. succès → `holds.forget` (jamais `release`), preuve relue du serveur.
@@ -183,8 +185,8 @@ export class PaymentService {
     //    `paymentStarted` ne suffit pas : posé AVANT l'appel d'intent, il survit à un intent en échec
     //    (Stripe, circuit ouvert, timeout, 5xx). `intentIssued` n'est posé qu'après le succès du PMS,
     //    juste avant que le `clientSecret` ne parte : une autorisation n'est possible qu'avec lui.
-    //    Panne Redis → 503 (aucun appel PMS) ; un hold perdu après autorisation reste rattrapable
-    //    par la réconciliation (#5).
+    //    Panne Redis → 503 (aucun appel PMS). Hold expiré (TTL de 75 min) après autorisation : le
+    //    paiement lu au PMS fait foi (#183), sans quoi le voyageur restait bloqué en 409.
     await this.assertIntentIssued(reservationId);
 
     // 4. Verrou single-flight. Une panne Redis remonte ici en 503 (jamais 500) et interrompt tout :
@@ -220,22 +222,84 @@ export class PaymentService {
 
   /**
    * Refuse (409 `payment-not-authorized`) une réservation `Pending` dont le tunnel n'a jamais émis
-   * d'intent : hold absent, ou présent sans `intentIssued` (gel posé mais intent en échec compris).
+   * d'intent : hold présent sans `intentIssued` (gel posé mais intent en échec compris).
    *
    * `paymentStarted` n'est volontairement pas lu : il peut être vrai sans paiement (intent en échec)
    * et faux avec un paiement (gel relâché par un refus postérieur à l'émission).
+   *
+   * **Hold absent** (#183) : l'enregistrement a un TTL fini (`holdTtlSeconds` +
+   * `holdRecordGraceSeconds`, 75 min) ; passé ce délai, il ne prouve plus rien, ni dans un sens ni
+   * dans l'autre. Le paiement lu au PMS (`assertPaymentEngaged`) prend alors le relais.
    *
    * La lecture passe par `CheckoutHoldService`, dont toute panne Redis remonte en 503 : dans le
    * doute, on ne confirme pas.
    */
   private async assertIntentIssued(reservationId: string): Promise<void> {
     const hold = await this.holds.read(reservationId);
-    if (hold?.intentIssued !== true) {
+    if (hold === null) {
+      await this.assertPaymentEngaged(reservationId);
+      return;
+    }
+    if (hold.intentIssued !== true) {
       this.logger.warn(
         `Confirmation refusée pour la réservation ${reservationId} : aucun intent émis.`,
       );
       throw toConfirmException('payment-not-authorized');
     }
+  }
+
+  /**
+   * Hold absent ou expiré (#183) : la preuve du paiement vient du PMS, par la route de service
+   * `GET /reservations/{id}/payment` (#153), avec la même règle que la réconciliation (#5) :
+   *
+   * - argent engagé chez Stripe (`requires_capture`, `succeeded`, Stripe lisible) : la confirmation
+   *   est tentée, sous le même verrou single-flight (AC-1) ;
+   * - aucune ligne `Payment`, intent sans argent retenu, ou remboursement : 409
+   *   `payment-not-authorized`, avec le statut de débit établi ;
+   * - tout le reste (lecture en panne, Stripe illisible, intent en cours, réponse vide) : 503
+   *   `payment-verification-pending`, rejouable (AC-2). Jamais « aucun paiement autorisé » sur un
+   *   doute, jamais une confirmation sans preuve : le PMS confirme SANS capture une réservation sans
+   *   ligne `Payment` (#182).
+   */
+  private async assertPaymentEngaged(reservationId: string): Promise<void> {
+    let payment: PmsPaymentState | null | undefined;
+    try {
+      const path = PMS_CONFIRMATION_ENDPOINTS.payment(reservationId);
+      const res = await this.pms.get<PmsReservationPayment>(
+        path,
+        this.serviceKey.serviceContext('GET', path, this.pmsContext()),
+      );
+      if (!res.data) {
+        throw new Error('réponse vide');
+      }
+      payment = res.data.payment ?? null;
+    } catch {
+      this.logger.warn(
+        `Confirmation de la réservation ${reservationId} différée : hold absent, paiement illisible.`,
+      );
+      throw toConfirmException('payment-verification-pending');
+    }
+
+    const evidence = paymentEvidenceOf(payment);
+    if (evidence === 'engaged') {
+      this.logger.log(
+        `Hold absent pour la réservation ${reservationId} : argent engagé lu au PMS, confirmation tentée.`,
+      );
+      return;
+    }
+    if (evidence === 'absent') {
+      this.logger.warn(
+        `Confirmation refusée pour la réservation ${reservationId} : hold absent, aucun paiement engagé.`,
+      );
+      throw toConfirmException(
+        'payment-not-authorized',
+        debitStatusOfPayment(payment),
+      );
+    }
+    this.logger.warn(
+      `Confirmation de la réservation ${reservationId} différée : hold absent, paiement non établi.`,
+    );
+    throw toConfirmException('payment-verification-pending');
   }
 
   /** Relecture de la réservation, avec le motif de confirmation sur une réservation introuvable. */
@@ -817,6 +881,41 @@ function reconstituted(
     total,
     servicesTotal: Math.max(0, total - before.roomTotal),
   };
+}
+
+/**
+ * `intentStatus` d'un argent **engagé** : retenu sur la carte (capture manuelle, D8) ou encaissé.
+ * Même ensemble que la réconciliation (#5, `MONEY_ENGAGED`).
+ */
+const INTENT_MONEY_ENGAGED: ReadonlySet<string> = new Set([
+  'requires_capture',
+  'succeeded',
+]);
+
+/**
+ * Preuve de paiement d'une réservation dont le hold a disparu (#183) :
+ * - `engaged` : Stripe lisible et argent engagé, la confirmation peut partir ;
+ * - `absent` : aucune ligne `Payment`, remboursement, ou intent Stripe sans argent retenu ;
+ * - `unverified` : Stripe illisible, intent en cours ou statut inconnu, rien n'est établi.
+ */
+function paymentEvidenceOf(
+  payment: PmsPaymentState | null,
+): 'engaged' | 'absent' | 'unverified' {
+  if (payment === null) {
+    return 'absent';
+  }
+  if (payment.status === PAYMENT_STATUS_REFUNDED) {
+    return 'absent';
+  }
+  if (payment.stripeReadable !== true || !payment.intentStatus) {
+    return 'unverified';
+  }
+  if (INTENT_MONEY_ENGAGED.has(payment.intentStatus)) {
+    return 'engaged';
+  }
+  return INTENT_WITHOUT_DEBIT.has(payment.intentStatus)
+    ? 'absent'
+    : 'unverified';
 }
 
 function delay(ms: number): Promise<void> {

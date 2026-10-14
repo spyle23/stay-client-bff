@@ -532,7 +532,6 @@ describe('PaymentService.confirm', () => {
         'gel posé, intentIssued absent (hold antérieur au correctif)',
         heldRecord({ paymentStarted: true, intentIssued: undefined }),
       ],
-      ['hold absent (expiré, libéré ou jamais créé)', null],
     ])(
       'Pending + %s : 409 payment-not-authorized, aucun appel PMS, aucun verrou',
       async (_label, hold) => {
@@ -542,6 +541,8 @@ describe('PaymentService.confirm', () => {
 
         expect(type).toBeInstanceOf(ConflictException);
         expect(reason).toBe('payment-not-authorized');
+        // Le hold présent fait foi : aucune lecture du paiement, aucun appel PMS.
+        expect(pms.get).not.toHaveBeenCalled();
         expect(pms.post).not.toHaveBeenCalled();
         expect(holds.forget).not.toHaveBeenCalled();
         expect(
@@ -582,6 +583,193 @@ describe('PaymentService.confirm', () => {
         expect(pms.post).not.toHaveBeenCalled();
       },
     );
+
+    /**
+     * #183 — le hold a un TTL fini (75 min) : passé ce délai, une réservation dont la carte est bien
+     * retenue n'a plus d'enregistrement. Le paiement lu au PMS (route de service, #153) prend le
+     * relais : argent engagé → confirmation (même verrou), aucun paiement → 409, doute → motif
+     * rejouable « vérification en cours », jamais « aucun paiement autorisé ».
+     */
+    describe('hold absent ou expiré (#183)', () => {
+      const failure = async () => {
+        const err: unknown = await service
+          .confirm(session, RESERVATION_ID)
+          .catch((e: unknown) => e);
+        const response = (
+          err as { getResponse?: () => { errors?: Record<string, string[]> } }
+        ).getResponse?.();
+        return { err, errors: response?.errors ?? {} };
+      };
+
+      beforeEach(() => {
+        holds.read.mockImplementation(() => {
+          calls.push('holds.read');
+          return Promise.resolve(null);
+        });
+      });
+
+      it.each([
+        ['carte retenue (requires_capture)', 8, 'requires_capture'],
+        ['déjà encaissé (succeeded)', 3, 'succeeded'],
+        ['statut local en retard, carte retenue', 1, 'requires_capture'],
+      ])(
+        'AC-1 : %s → confirmation tentée, une seule, sous le verrou',
+        async (_label, status, intentStatus) => {
+          pms.get.mockResolvedValue(paymentState({ status, intentStatus }));
+
+          await expect(
+            service.confirm(session, RESERVATION_ID),
+          ).resolves.toMatchObject({ status: 'Confirmed' });
+
+          expect(pms.post).toHaveBeenCalledTimes(1);
+          expect(pms.post).toHaveBeenCalledWith(
+            CONFIRM_PATH,
+            undefined,
+            expect.anything(),
+          );
+          expect(
+            await redis.get(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID),
+          ).toBeNull();
+        },
+      );
+
+      it('AC-1 : lit le paiement par la route de service AVANT le POST, jamais avec un Bearer', async () => {
+        pms.get.mockImplementation((path: string) => {
+          calls.push(`pms.get ${path}`);
+          return Promise.resolve(
+            paymentState({ status: 8, intentStatus: 'requires_capture' }),
+          );
+        });
+
+        await service.confirm(session, RESERVATION_ID);
+
+        expect(calls).toEqual([
+          'booking.getReservation',
+          'holds.read',
+          `pms.get /reservations/${RESERVATION_ID}/payment`,
+          `pms.post ${CONFIRM_PATH}`,
+          'booking.getReservation',
+          'holds.forget',
+        ]);
+        const [, ctx] = pms.get.mock.calls[0] as [
+          string,
+          { headers: Record<string, string>; bearerToken?: string },
+        ];
+        expect(ctx.headers['X-Service-Key']).toBe('svc-key-test');
+        expect(ctx.bearerToken).toBeUndefined();
+      });
+
+      it('AC-1 : même single-flight — deux appels concurrents, un seul POST', async () => {
+        pms.get.mockResolvedValue(
+          paymentState({ status: 8, intentStatus: 'requires_capture' }),
+        );
+        let releasePms!: () => void;
+        const pmsGate = new Promise<void>((resolve) => {
+          releasePms = resolve;
+        });
+        let confirmed = false;
+        booking.getReservation.mockImplementation(() =>
+          Promise.resolve(
+            reservation({ status: confirmed ? 'Confirmed' : 'Pending' }),
+          ),
+        );
+        pms.post.mockImplementation(async () => {
+          await pmsGate;
+          confirmed = true;
+          return pmsConfirmation();
+        });
+
+        const first = service.confirm(session, RESERVATION_ID);
+        const second = service.confirm(session, RESERVATION_ID);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        releasePms();
+        await Promise.all([first, second]);
+
+        expect(pms.post).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['aucune ligne Payment', null],
+        [
+          'formulaire jamais soumis',
+          { status: 1, intentStatus: 'requires_payment_method' },
+        ],
+        ['autorisation annulée', { status: 5, intentStatus: 'canceled' }],
+      ])(
+        '%s → 409 payment-not-authorized, aucun POST, aucun verrou',
+        async (_label, payment) => {
+          pms.get.mockResolvedValue(paymentState(payment));
+
+          const { err, errors } = await failure();
+
+          expect(err).toBeInstanceOf(ConflictException);
+          expect(errors.reason).toEqual(['payment-not-authorized']);
+          expect(errors.debit).toEqual(['none']);
+          expect(pms.post).not.toHaveBeenCalled();
+          expect(
+            await redis.get(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID),
+          ).toBeNull();
+        },
+      );
+
+      it('remboursement enregistré → 409, débit « refunded », jamais de confirmation', async () => {
+        pms.get.mockResolvedValue(
+          paymentState({ status: 6, intentStatus: 'succeeded' }),
+        );
+
+        const { err, errors } = await failure();
+
+        expect(err).toBeInstanceOf(ConflictException);
+        expect(errors.reason).toEqual(['payment-not-authorized']);
+        expect(errors.debit).toEqual(['refunded']);
+        expect(pms.post).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        [
+          'lecture du paiement en panne',
+          () => pms.get.mockRejectedValue(new PmsUnavailableError('down')),
+        ],
+        [
+          'Stripe illisible (statut local Authorized)',
+          () =>
+            pms.get.mockResolvedValue(
+              paymentState({
+                status: 8,
+                intentStatus: null,
+                stripeReadable: false,
+              }),
+            ),
+        ],
+        [
+          'intent en cours de traitement',
+          () =>
+            pms.get.mockResolvedValue(
+              paymentState({ status: 2, intentStatus: 'processing' }),
+            ),
+        ],
+        ['réponse vide', () => pms.get.mockResolvedValue({ success: true })],
+      ])(
+        'AC-2 : %s → 503 payment-verification-pending, rejouable, aucun POST',
+        async (_label, arrange) => {
+          arrange();
+
+          const { err, errors } = await failure();
+
+          expect(err).toBeInstanceOf(ServiceUnavailableException);
+          expect(errors.reason).toEqual(['payment-verification-pending']);
+          // Rien n'est établi : aucun statut de débit inventé.
+          expect(errors).not.toHaveProperty('debit');
+          expect(
+            JSON.stringify((err as ServiceUnavailableException).getResponse()),
+          ).not.toMatch(/aucun paiement autorisé|n'est pas autorisé/i);
+          expect(pms.post).not.toHaveBeenCalled();
+          expect(
+            await redis.get(CONFIRM_LOCK_KEY_PREFIX + RESERVATION_ID),
+          ).toBeNull();
+        },
+      );
+    });
 
     it('annulée sans hold : reservation-cancelled reste le motif (statut d’abord)', async () => {
       booking.getReservation.mockResolvedValue(
