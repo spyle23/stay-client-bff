@@ -119,7 +119,11 @@ const heldRecord = (
 
 /** `GET /reservations/{id}/payment` (#153) : `status` = `PaymentStatus` du PMS (Refunded = 6). */
 const paymentState = (
-  payment: { status: number; intentStatus?: string | null } | null,
+  payment: {
+    status: number;
+    intentStatus?: string | null;
+    stripeReadable?: boolean;
+  } | null,
 ) => ({
   success: true,
   data: {
@@ -886,16 +890,16 @@ describe('PaymentService.confirm', () => {
     });
 
     it.each([
-      [5, 'none'],
-      [6, 'refunded'],
-      [3, 'captured'],
+      [5, 'canceled', 'none'],
+      [6, 'succeeded', 'refunded'],
+      [3, 'succeeded', 'captured'],
     ])(
-      'réservation annulée relue (paiement %i) → reservation-cancelled, débit « %s »',
-      async (status, debit) => {
+      'réservation annulée relue (paiement %i, intent %s) → reservation-cancelled, débit « %s »',
+      async (status, intentStatus, debit) => {
         booking.getReservation.mockResolvedValue(
           reservation({ status: 'Cancelled' }),
         );
-        pms.get.mockResolvedValue(paymentState({ status }));
+        pms.get.mockResolvedValue(paymentState({ status, intentStatus }));
 
         const { errors } = await failure();
 
@@ -913,6 +917,140 @@ describe('PaymentService.confirm', () => {
       const { errors } = await failure();
 
       expect(errors.debit).toEqual(['none']);
+    });
+
+    /**
+     * Revue #4, ronde 1 : le statut de débit suit l'intent tel que Stripe le tient au moment de la
+     * lecture (#153), le statut local en repli ; ce qui n'est pas établi n'est jamais « aucun débit ».
+     */
+    it.each([
+      ['autorisation encore posée', 8, 'requires_capture', true, 'held'],
+      ['encaissé, statut local en retard', 8, 'succeeded', true, 'captured'],
+      ['annulée chez Stripe', 8, 'canceled', true, 'none'],
+      ['formulaire jamais soumis', 1, 'requires_payment_method', true, 'none'],
+      ['Stripe illisible, encaissé', 3, null, false, 'captured'],
+      ['Stripe illisible, autorisé', 8, null, false, 'held'],
+      ['Stripe illisible, annulé', 5, null, false, 'none'],
+    ])(
+      '%s (paiement %i, intent %s, Stripe lisible %s) → débit « %s »',
+      async (_label, status, intentStatus, stripeReadable, debit) => {
+        booking.getReservation.mockResolvedValue(
+          reservation({ status: 'Cancelled' }),
+        );
+        pms.get.mockResolvedValue(
+          paymentState({ status, intentStatus, stripeReadable }),
+        );
+
+        const { errors } = await failure();
+
+        expect(errors.debit).toEqual([debit]);
+      },
+    );
+
+    it.each([
+      ['intent en cours de traitement', 2, 'processing', true],
+      ['statut d’intent inconnu', 8, 'requires_unknown_step', true],
+      ['Stripe illisible, paiement en attente', 1, null, false],
+    ])(
+      '%s : aucun statut de débit énoncé (jamais « aucun débit » par défaut)',
+      async (_label, status, intentStatus, stripeReadable) => {
+        booking.getReservation.mockResolvedValue(
+          reservation({ status: 'Cancelled' }),
+        );
+        pms.get.mockResolvedValue(
+          paymentState({ status, intentStatus, stripeReadable }),
+        );
+
+        const { errors } = await failure();
+
+        expect(errors.reason).toEqual(['reservation-cancelled']);
+        expect(errors).not.toHaveProperty('debit');
+      },
+    );
+  });
+
+  /**
+   * Revue #4, ronde 1 — la chambre est prise, mais Stripe n'a pu ni annuler ni rembourser : le PMS
+   * répond 502 `PaymentReleaseFailed` et laisse la réservation telle quelle. Panne rejouable (503,
+   * « Réessayer »), avec le statut de débit RÉEL : autorisation posée ou argent encaissé, jamais
+   * « aucun débit ».
+   */
+  describe('paiement non libéré par Stripe (#4, AC-5, AC-8)', () => {
+    const releaseFailed = () =>
+      new PmsUnavailableError('Le PMS ne répond pas.', undefined, {
+        status: 502,
+        body: {
+          success: false,
+          errors: ['The payment of this reservation could not be released'],
+        },
+      });
+
+    const failure = async () => {
+      const err: unknown = await service
+        .confirm(session, RESERVATION_ID)
+        .catch((e: unknown) => e);
+      const response = (
+        err as {
+          getResponse?: () => { errors?: Record<string, string[]> };
+        }
+      ).getResponse?.();
+      return { err, errors: response?.errors ?? {} };
+    };
+
+    it.each([
+      ['autorisation encore posée', 8, 'requires_capture', 'held'],
+      [
+        'argent encaissé, remboursement refusé (AC-5)',
+        3,
+        'succeeded',
+        'captured',
+      ],
+    ])(
+      '%s → 503 rejouable, débit « %s », sans motif métier',
+      async (_label, status, intentStatus, debit) => {
+        pms.post.mockRejectedValueOnce(releaseFailed());
+        pms.get.mockResolvedValue(paymentState({ status, intentStatus }));
+
+        const { err, errors } = await failure();
+
+        expect(err).toBeInstanceOf(ServiceUnavailableException);
+        expect(errors.debit).toEqual([debit]);
+        expect(errors).not.toHaveProperty('reason');
+      },
+    );
+
+    it('la réservation reste vivante : le hold n’est pas libéré (le rejeu est sûr)', async () => {
+      pms.post.mockRejectedValueOnce(releaseFailed());
+      pms.get.mockResolvedValue(
+        paymentState({ status: 8, intentStatus: 'requires_capture' }),
+      );
+
+      await failure();
+
+      expect(holds.release).not.toHaveBeenCalled();
+    });
+
+    it('lecture du paiement en échec : 503 sans statut de débit, jamais « aucun débit »', async () => {
+      pms.post.mockRejectedValueOnce(releaseFailed());
+      pms.get.mockRejectedValue(new PmsUnavailableError('down'));
+
+      const { err, errors } = await failure();
+
+      expect(err).toBeInstanceOf(ServiceUnavailableException);
+      expect(errors).not.toHaveProperty('debit');
+    });
+
+    it('aucun texte du PMS ne traverse la frontière', async () => {
+      pms.post.mockRejectedValueOnce(releaseFailed());
+      pms.get.mockResolvedValue(
+        paymentState({ status: 8, intentStatus: 'requires_capture' }),
+      );
+
+      const { err } = await failure();
+
+      expect(
+        JSON.stringify((err as ServiceUnavailableException).getResponse()),
+      ).not.toMatch(/could not be released/);
     });
   });
 

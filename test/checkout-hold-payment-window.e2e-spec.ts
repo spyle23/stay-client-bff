@@ -465,5 +465,48 @@ describe('booking/payment window (e2e — Redis réel + PMS mocké)', () => {
         expect(await readHold()).toBeNull();
       },
     );
+
+    /**
+     * Revue #4, ronde 1 : Stripe n'a pu ni annuler ni rembourser (502 `PaymentReleaseFailed`, rejoué
+     * par la frontière puis épuisé). 503 rejouable, statut de débit réel lu à l'intent, hold conservé.
+     */
+    it.each([
+      ['autorisation encore posée', 8, 'requires_capture', 'held'],
+      ['argent encaissé (AC-5)', 3, 'succeeded', 'captured'],
+    ])(
+      '%s, paiement non libéré : 503, statut de débit « %s », hold conservé',
+      async (_label, status, intent, debit) => {
+        await emitIntent();
+        nock(PMS_HOST)
+          .persist()
+          .post(confirmPath())
+          .reply(function () {
+            record('POST', confirmPath(), this.req.headers);
+            return [
+              502,
+              {
+                success: false,
+                errors: [
+                  'The payment of this reservation could not be released',
+                ],
+              },
+            ];
+          });
+        paymentStatus = status;
+        intentStatus = intent;
+
+        const res = await request(app.getHttpServer())
+          .post(`/api/v1/payment/reservations/${reservationId}/confirm`)
+          .set('Cookie', cookie)
+          .expect(503);
+
+        const body = res.body as { errors?: Record<string, string[]> };
+        expect(body.errors?.debit).toEqual([debit]);
+        expect(body.errors).not.toHaveProperty('reason');
+        expect(JSON.stringify(res.body)).not.toMatch(/could not be released/);
+        // La réservation reste telle quelle côté PMS : le rejeu doit rester possible.
+        expect(await readHold()).not.toBeNull();
+      },
+    );
   });
 });

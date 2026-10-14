@@ -26,8 +26,10 @@ import {
   classifyConfirmFailure,
   type ConfirmDebitStatus,
   confirmIdempotencyKey,
+  isPaymentReleaseFailure,
   PMS_CONFIRMATION_ENDPOINTS,
   toConfirmException,
+  toReleaseFailedException,
 } from './confirm-errors';
 import { ConfirmationLockService } from './confirmation-lock.service';
 import type { ConfirmationProofDto } from './dto/confirmation-proof.dto';
@@ -43,12 +45,30 @@ import { PaymentReconcileStore } from './reconcile.store';
 
 type PmsPaymentIntent = components['schemas']['PaymentIntentResultDto'];
 type PmsConfirmation = components['schemas']['ConfirmationResultDto'];
+type PmsPaymentState = components['schemas']['PaymentStateDto'];
 type PmsReservationPayment =
   components['schemas']['ReservationPaymentStateDto'];
 
-/** `PaymentStatus` du PMS (Pending=1, Processing=2, Succeeded=3, Failed=4, Cancelled=5, Refunded=6…). */
+/**
+ * `PaymentStatus` du PMS (Pending=1, Processing=2, Succeeded=3, Failed=4, Cancelled=5, Refunded=6,
+ * RequiresAction=7, Authorized=8).
+ */
 const PAYMENT_STATUS_SUCCEEDED = 3;
+const PAYMENT_STATUS_FAILED = 4;
+const PAYMENT_STATUS_CANCELLED = 5;
 const PAYMENT_STATUS_REFUNDED = 6;
+const PAYMENT_STATUS_AUTHORIZED = 8;
+
+/**
+ * `intentStatus` Stripe sans aucun argent retenu ni encaissé : formulaire jamais abouti, ou
+ * autorisation annulée. Tout autre statut (`processing`, inconnu) laisse le débit non établi.
+ */
+const INTENT_WITHOUT_DEBIT: ReadonlySet<string> = new Set([
+  'canceled',
+  'requires_payment_method',
+  'requires_confirmation',
+  'requires_action',
+]);
 
 /**
  * Statuts déjà au-delà de la confirmation : la preuve se construit depuis la relecture, sans
@@ -285,6 +305,15 @@ export class PaymentService {
         );
         throw toConfirmException(reason);
       }
+      if (isPaymentReleaseFailure(err)) {
+        // #4 AC-5 / AC-8 (revue ronde 1) : Stripe n'a pu ni annuler ni rembourser ; la réservation
+        // reste telle quelle (hold conservé, rejeu sûr). Panne rejouable, mais avec le statut de
+        // débit réel : autorisation posée ou argent encaissé, jamais « aucun débit » par défaut.
+        this.logger.warn(
+          `Confirmation de la réservation ${reservationId} : paiement non libéré par Stripe.`,
+        );
+        throw toReleaseFailedException(await this.debitStatusOf(reservationId));
+      }
       if (
         err instanceof PmsRequestError &&
         (err.status === 401 || err.status === 403)
@@ -307,12 +336,12 @@ export class PaymentService {
   }
 
   /**
-   * Statut de débit d'une réservation qui ne sera pas confirmée (#4, AC-8), d'après le dernier
-   * paiement lu par la route de service `GET /reservations/{id}/payment` (#153) : remboursé
-   * (`Refunded`), encaissé sans remboursement (`Succeeded`), sinon aucun débit conservé.
+   * Statut de débit d'une réservation qui n'a pas été confirmée (#4, AC-8), d'après le dernier
+   * paiement lu par la route de service `GET /reservations/{id}/payment` (#153).
    *
-   * Lecture en échec : `undefined`, jamais un statut deviné. Best-effort : elle ne masque jamais le
-   * refus d'origine, qui est ce que le voyageur doit voir.
+   * Lecture en échec, ou état qui n'établit rien (intent `processing`, statut inconnu) :
+   * `undefined`, jamais un statut deviné. Best-effort : elle ne masque jamais le refus d'origine,
+   * qui est ce que le voyageur doit voir.
    */
   private async debitStatusOf(
     reservationId: string,
@@ -323,14 +352,7 @@ export class PaymentService {
         path,
         this.serviceKey.serviceContext('GET', path, this.pmsContext()),
       );
-      if (!res.data) {
-        return undefined;
-      }
-      const status = res.data.payment?.status;
-      if (status === PAYMENT_STATUS_REFUNDED) {
-        return 'refunded';
-      }
-      return status === PAYMENT_STATUS_SUCCEEDED ? 'captured' : 'none';
+      return res.data ? debitStatusOfPayment(res.data.payment) : undefined;
     } catch {
       this.logger.warn(
         `Statut de débit de la réservation ${reservationId} illisible : non énoncé.`,
@@ -799,4 +821,46 @@ function reconstituted(
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Statut de débit d'un paiement lu au PMS (#4, AC-8 ; revue ronde 1). L'intent tel que Stripe le
+ * tient au moment de la lecture (#153) prime sur le statut local, qu'un échec de libération ne
+ * modifie pas ; le statut local ne sert qu'en repli quand Stripe n'a pas répondu.
+ *
+ * - aucun paiement : `none` ;
+ * - remboursement enregistré : `refunded` (l'intent reste `succeeded` après un remboursement) ;
+ * - `succeeded` : `captured` ; `requires_capture` : `held` ; intent sans argent retenu : `none` ;
+ * - tout le reste (`processing`, statut inconnu, attente sans Stripe lisible) : `undefined`.
+ */
+function debitStatusOfPayment(
+  payment: PmsPaymentState | null | undefined,
+): ConfirmDebitStatus | undefined {
+  if (!payment) {
+    return 'none';
+  }
+  if (payment.status === PAYMENT_STATUS_REFUNDED) {
+    return 'refunded';
+  }
+  const intent = payment.stripeReadable === true ? payment.intentStatus : null;
+  if (intent) {
+    if (intent === 'succeeded') {
+      return 'captured';
+    }
+    if (intent === 'requires_capture') {
+      return 'held';
+    }
+    return INTENT_WITHOUT_DEBIT.has(intent) ? 'none' : undefined;
+  }
+  switch (payment.status) {
+    case PAYMENT_STATUS_SUCCEEDED:
+      return 'captured';
+    case PAYMENT_STATUS_AUTHORIZED:
+      return 'held';
+    case PAYMENT_STATUS_CANCELLED:
+    case PAYMENT_STATUS_FAILED:
+      return 'none';
+    default:
+      return undefined;
+  }
 }

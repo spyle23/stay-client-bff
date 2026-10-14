@@ -3,6 +3,7 @@ import {
   BadRequestException,
   ConflictException,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import {
@@ -13,8 +14,10 @@ import {
   classifyConfirmFailure,
   CONFIRM_DEBIT_KEY,
   CONFIRM_REASON_KEY,
+  isPaymentReleaseFailure,
   PMS_CONFIRMATION_ENDPOINTS,
   toConfirmException,
+  toReleaseFailedException,
   type ConfirmFailureReason,
 } from './confirm-errors';
 
@@ -130,6 +133,42 @@ describe('classifyConfirmFailure', () => {
     ).toBeNull();
   });
 
+  /**
+   * Revue #4, ronde 1 : ce 502 reste une panne, mais le service doit pouvoir le reconnaître pour y
+   * joindre le statut de débit réel (autorisation encore posée, montant encaissé).
+   */
+  describe('isPaymentReleaseFailure (#4, AC-8)', () => {
+    it('reconnaît le 502 « paiement non libéré » du PMS', () => {
+      expect(
+        isPaymentReleaseFailure(
+          gateway('The payment of this reservation could not be released'),
+        ),
+      ).toBe(true);
+    });
+
+    it('ne confond ni un autre 502, ni un 502 de proxy, ni un refus 4xx', () => {
+      expect(isPaymentReleaseFailure(gateway('Payment capture failed'))).toBe(
+        false,
+      );
+      expect(
+        isPaymentReleaseFailure(
+          new PmsUnavailableError('down', undefined, {
+            status: 502,
+            body: '<html>Bad Gateway</html>',
+          }),
+        ),
+      ).toBe(false);
+      expect(isPaymentReleaseFailure(new PmsUnavailableError('down'))).toBe(
+        false,
+      );
+      expect(
+        isPaymentReleaseFailure(
+          refused(409, 'The payment of this reservation could not be released'),
+        ),
+      ).toBe(false);
+    });
+  });
+
   it('401/403 sur /confirm vise la CLÉ DE SERVICE, pas la session : panne, pas « reconnectez-vous »', () => {
     // Renvoyer le voyageur à l'identification ne corrigerait rien : c'est la configuration du BFF.
     expect(classifyConfirmFailure(refused(401, 'Invalid key'))).toBeNull();
@@ -188,6 +227,32 @@ describe('toConfirmException — statut de débit (#4, AC-8)', () => {
       errors: Record<string, string[]>;
     };
     expect(body.errors).not.toHaveProperty(CONFIRM_DEBIT_KEY);
+  });
+});
+
+describe('toReleaseFailedException (#4, AC-8)', () => {
+  it.each(['held', 'captured', 'refunded', 'none'] as const)(
+    '503 rejouable, sans motif métier, avec le statut de débit « %s »',
+    (debit) => {
+      const exception = toReleaseFailedException(debit);
+      const body = exception.getResponse() as {
+        message: string;
+        errors: Record<string, string[]>;
+      };
+
+      expect(exception).toBeInstanceOf(ServiceUnavailableException);
+      expect(body.errors[CONFIRM_DEBIT_KEY]).toEqual([debit]);
+      // 503 sans motif : le front y lit « indisponible », donc « Réessayer ».
+      expect(body.errors).not.toHaveProperty(CONFIRM_REASON_KEY);
+      expect(body.message).not.toMatch(/could not be released/);
+    },
+  );
+
+  it('statut de débit inconnu : aucun champ `errors` inventé', () => {
+    const body = toReleaseFailedException().getResponse() as {
+      errors?: Record<string, string[]>;
+    };
+    expect(body.errors).toBeUndefined();
   });
 });
 
