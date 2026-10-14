@@ -2,6 +2,7 @@ import { Logger, UnauthorizedException } from '@nestjs/common';
 import type { SchedulerRegistry } from '@nestjs/schedule';
 import type { PmsClientService } from '../../integration/pms/pms-client.service';
 import { PmsUnavailableError } from '../../integration/pms/pms-errors';
+import type { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
 import type { SessionService } from '../auth/session.service';
 import type { BookingOptions } from './booking.constants';
 import type { CheckoutHoldService } from './checkout-hold.service';
@@ -32,6 +33,7 @@ const options: BookingOptions = {
   pmsCallBudgetMs: 24_750,
   intentReconcileDelayMs: 90_000,
   communicationLocaleTtlSeconds: 172_800,
+  paymentWindowSeconds: 1_800,
 };
 
 function holdRecord(overrides: Record<string, unknown> = {}) {
@@ -87,6 +89,52 @@ function orphanReservation(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Paiement lu par la route de service `GET /reservations/{id}/payment` (#153). */
+function payment(overrides: Record<string, unknown> = {}) {
+  return {
+    paymentId: '99999999-9999-4999-8999-999999999999',
+    status: 1,
+    amount: 168,
+    currency: 'EUR',
+    intentStatus: 'requires_payment_method',
+    amountCapturable: 0,
+    amountReceived: 0,
+    stripeReadable: true,
+    createdAt: new Date(Date.now() - 3_600_000).toISOString(),
+    paidAt: null,
+    ...overrides,
+  };
+}
+
+/**
+ * Aiguille les lectures PMS par chemin : la réservation (JWT du voyageur) et son paiement (route
+ * de service). `payment: null` simule une réservation sans aucune ligne `Payment`.
+ */
+function routePms(
+  deps: ReturnType<typeof makeDeps>,
+  setup: {
+    status?: number;
+    payment?: Record<string, unknown> | null;
+    paymentError?: Error;
+  },
+): void {
+  deps.get.mockImplementation((path: string) => {
+    if (path.endsWith('/payment')) {
+      if (setup.paymentError) {
+        return Promise.reject(setup.paymentError);
+      }
+      return Promise.resolve({
+        success: true,
+        data: { reservationId: RESERVATION_ID, payment: setup.payment ?? null },
+      });
+    }
+    return Promise.resolve({
+      success: true,
+      data: { status: setup.status ?? 1 },
+    });
+  });
+}
+
 function makeDeps() {
   return {
     acquireSweeperLock: jest.fn().mockResolvedValue('sweep-token'),
@@ -100,6 +148,7 @@ function makeDeps() {
     dropIntent: jest.fn().mockResolvedValue(undefined),
     rescheduleIntent: jest.fn().mockResolvedValue(1),
     clearIdempotentKey: jest.fn().mockResolvedValue(undefined),
+    defer: jest.fn().mockResolvedValue(true),
     get: jest.fn().mockResolvedValue({ success: true, data: { status: 1 } }),
     getList: jest.fn().mockResolvedValue(myReservations([orphanReservation()])),
     post: jest.fn().mockResolvedValue({ success: true, data: undefined }),
@@ -107,6 +156,13 @@ function makeDeps() {
     // fidèlement (il résout la session PUIS exécute l'opération avec le jeton obtenu).
     withCustomerAuth: jest.fn(
       (_sid: string, fn: (token: string) => Promise<unknown>) => fn('jeton'),
+    ),
+    // Lecture de service (#5) : le double marque le contexte pour prouver la route empruntée.
+    serviceContext: jest.fn(
+      (method: string, path: string, extra?: Record<string, unknown>) => ({
+        ...extra,
+        headers: { 'X-Service-Key': `service:${method} ${path}` },
+      }),
     ),
     addInterval: jest.fn(),
     deleteInterval: jest.fn(),
@@ -131,6 +187,7 @@ function buildSweeper(
       dropIntent: deps.dropIntent,
       rescheduleIntent: deps.rescheduleIntent,
       clearIdempotentKey: deps.clearIdempotentKey,
+      defer: deps.defer,
     } as unknown as CheckoutHoldService,
     { withCustomerAuth: deps.withCustomerAuth } as unknown as SessionService,
     {
@@ -138,6 +195,7 @@ function buildSweeper(
       getList: deps.getList,
       post: deps.post,
     } as unknown as PmsClientService,
+    { serviceContext: deps.serviceContext } as unknown as ServiceKeyProvider,
     {
       addInterval: deps.addInterval,
       deleteInterval: deps.deleteInterval,
@@ -232,14 +290,22 @@ describe('CheckoutHoldSweeper', () => {
       expect(deps.post).not.toHaveBeenCalled();
     });
 
-    it('n’annule JAMAIS un hold dont le paiement est engagé (seam story 3.1)', async () => {
-      deps.read.mockResolvedValue(holdRecord({ paymentStarted: true }));
+    it('n’annule JAMAIS un hold dont l’autorisation est acquise (seam story 3.1)', async () => {
+      deps.read.mockResolvedValue(
+        holdRecord({
+          paymentStarted: true,
+          intentIssued: true,
+          intentIssuedAt: Date.now() - 7_200_000,
+        }),
+      );
+      routePms(deps, {
+        payment: payment({ intentStatus: 'requires_capture' }),
+      });
 
       await sweeper.sweep();
 
-      expect(deps.get).not.toHaveBeenCalled();
       expect(deps.post).not.toHaveBeenCalled();
-      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      expect(deps.release).not.toHaveBeenCalled();
     });
 
     /**
@@ -302,7 +368,13 @@ describe('CheckoutHoldSweeper', () => {
       expect(deps.get).toHaveBeenCalled(); // le statut `Pending` a bien été constaté
       expect(deps.post).not.toHaveBeenCalled();
       expect(deps.release).not.toHaveBeenCalled();
-      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      // #4 : le hold reste suivi (fin du `forget` immédiat) ; la passe suivante lira le paiement.
+      expect(deps.forget).not.toHaveBeenCalled();
+      expect(deps.defer).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        expect.any(Number),
+      );
+      expect(deps.reschedule).not.toHaveBeenCalled();
     });
 
     it('renonce à annuler si l’enregistrement disparaît pendant la passe (doute)', async () => {
@@ -314,6 +386,276 @@ describe('CheckoutHoldSweeper', () => {
       expect(deps.post).not.toHaveBeenCalled();
       expect(error).toHaveBeenCalledWith(
         expect.stringContaining('Intervention manuelle requise'),
+      );
+    });
+  });
+
+  /**
+   * #4 (story 3.3) — formulaire de paiement abandonné. Le hold `paymentStarted` reste dans l'index
+   * jusqu'à son issue : le balayeur lit le paiement au PMS (route de service de #153) et n'annule
+   * qu'un intent resté en attente du voyageur au-delà de la fenêtre de paiement.
+   */
+  describe('fenêtre de paiement (#4, AC-2, AC-3, AC-9)', () => {
+    const WINDOW_MS = options.paymentWindowSeconds * 1000;
+    const paymentPath = `/reservations/${RESERVATION_ID}/payment`;
+
+    /** Hold dont l'intent a été émis il y a `ageMs`. */
+    function issuedHold(
+      ageMs: number,
+      overrides: Record<string, unknown> = {},
+    ) {
+      return holdRecord({
+        paymentStarted: true,
+        intentIssued: true,
+        paymentStartedAt: Date.now() - ageMs - 1_000,
+        intentIssuedAt: Date.now() - ageMs,
+        ...overrides,
+      });
+    }
+
+    it.each([
+      'requires_payment_method',
+      'requires_confirmation',
+      'requires_action',
+    ])(
+      'AC-2 : intent `%s` au-delà de la fenêtre → annulation sous JWT du voyageur, hold libéré',
+      async (intentStatus) => {
+        deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+        routePms(deps, { payment: payment({ intentStatus }) });
+
+        await sweeper.sweep();
+
+        expect(deps.post).toHaveBeenCalledWith(
+          `/roomreservations/${RESERVATION_ID}/cancel`,
+          undefined,
+          expect.objectContaining({ bearerToken: 'jeton' }),
+        );
+        expect(deps.release).toHaveBeenCalledWith(RESERVATION_ID);
+      },
+    );
+
+    it('AC-2 : lit le paiement par la route de service, jamais avec le JWT du voyageur', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, { payment: payment() });
+
+      await sweeper.sweep();
+
+      const [method, path, extra] = deps.serviceContext.mock.calls[0] as [
+        string,
+        string,
+        { correlationId?: string },
+      ];
+      expect(method).toBe('GET');
+      expect(path).toBe(paymentPath);
+      expect(extra.correlationId).toMatch(/^sweeper-/);
+      const read = deps.get.mock.calls.find(
+        ([path]) => path === paymentPath,
+      ) as unknown as [string, Record<string, unknown>];
+      expect(read[1]).not.toHaveProperty('bearerToken');
+      expect(read[1]).toHaveProperty('headers');
+    });
+
+    it('AC-2 : avant la fin de la fenêtre, attend son échéance sans compter de tentative', async () => {
+      const hold = issuedHold(60_000);
+      deps.read.mockResolvedValue(hold);
+      routePms(deps, { payment: payment() });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.forget).not.toHaveBeenCalled();
+      expect(deps.reschedule).not.toHaveBeenCalled();
+      expect(deps.defer).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        ((hold as Record<string, unknown>).intentIssuedAt as number) +
+          WINDOW_MS,
+      );
+    });
+
+    it('AC-2 : la fenêtre part de l’émission de l’intent, pas de la pose du gel', async () => {
+      // Gel posé il y a longtemps, intent émis il y a 1 min : la fenêtre n'est pas écoulée.
+      deps.read.mockResolvedValue(
+        issuedHold(60_000, { paymentStartedAt: Date.now() - 2 * WINDOW_MS }),
+      );
+      routePms(deps, { payment: payment() });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+    });
+
+    it('AC-2 : un intent déjà annulé chez Stripe se libère aussi à la fin de la fenêtre', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, {
+        payment: payment({ intentStatus: 'canceled', status: 5 }),
+      });
+
+      await sweeper.sweep();
+
+      expect(deps.post).toHaveBeenCalledWith(
+        `/roomreservations/${RESERVATION_ID}/cancel`,
+        undefined,
+        expect.anything(),
+      );
+    });
+
+    it.each(['requires_capture', 'succeeded'])(
+      'AC-3 : intent `%s` → jamais annulé, laissé à la confirmation et à la réconciliation',
+      async (intentStatus) => {
+        deps.read.mockResolvedValue(issuedHold(10 * WINDOW_MS));
+        routePms(deps, { payment: payment({ intentStatus }) });
+
+        await sweeper.sweep();
+
+        expect(deps.post).not.toHaveBeenCalled();
+        expect(deps.release).not.toHaveBeenCalled();
+        expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      },
+    );
+
+    it.each([
+      ['intent `processing`', { intentStatus: 'processing' }],
+      ['Stripe illisible', { intentStatus: null, stripeReadable: false }],
+      ['statut d’intent inconnu', { intentStatus: 'requires_unknown_step' }],
+    ])(
+      'AC-3 : %s → doute, report sans tentative ni annulation',
+      async (_label, overrides) => {
+        deps.read.mockResolvedValue(issuedHold(10 * WINDOW_MS));
+        routePms(deps, { payment: payment(overrides) });
+
+        await sweeper.sweep();
+
+        expect(deps.post).not.toHaveBeenCalled();
+        expect(deps.forget).not.toHaveBeenCalled();
+        expect(deps.release).not.toHaveBeenCalled();
+        expect(deps.reschedule).not.toHaveBeenCalled();
+        expect(deps.defer).toHaveBeenCalledWith(
+          RESERVATION_ID,
+          expect.any(Number),
+        );
+      },
+    );
+
+    it('AC-3 : lecture du paiement en échec → report compté, jamais d’annulation', async () => {
+      deps.read.mockResolvedValue(issuedHold(10 * WINDOW_MS));
+      routePms(deps, { paymentError: new PmsUnavailableError('panne') });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.reschedule).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        expect.any(Number),
+      );
+    });
+
+    it('intent émis mais aucun paiement lu : doute, jamais d’annulation', async () => {
+      deps.read.mockResolvedValue(issuedHold(10 * WINDOW_MS));
+      routePms(deps, { payment: null });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.defer).toHaveBeenCalled();
+    });
+
+    it('gel sans intent ni paiement, fenêtre écoulée → annulation (autorisation orpheline)', async () => {
+      deps.read.mockResolvedValue(
+        holdRecord({
+          paymentStarted: true,
+          paymentStartedAt: Date.now() - WINDOW_MS - 1_000,
+        }),
+      );
+      routePms(deps, { payment: null });
+
+      await sweeper.sweep();
+
+      expect(deps.post).toHaveBeenCalledWith(
+        `/roomreservations/${RESERVATION_ID}/cancel`,
+        undefined,
+        expect.anything(),
+      );
+      expect(deps.release).toHaveBeenCalledWith(RESERVATION_ID);
+    });
+
+    it('gel sans intent, fenêtre en cours → attente (l’appel d’intent peut être en vol)', async () => {
+      const startedAt = Date.now() - 5_000;
+      deps.read.mockResolvedValue(
+        holdRecord({ paymentStarted: true, paymentStartedAt: startedAt }),
+      );
+      routePms(deps, { payment: null });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.defer).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        startedAt + WINDOW_MS,
+      );
+    });
+
+    it('hold antérieur au champ : la fenêtre part de la création du paiement au PMS', async () => {
+      deps.read.mockResolvedValue(
+        holdRecord({ paymentStarted: true, intentIssued: true }),
+      );
+      const createdAt = Date.now() - 120_000;
+      routePms(deps, {
+        payment: payment({ createdAt: new Date(createdAt).toISOString() }),
+      });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.defer).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        createdAt + WINDOW_MS,
+      );
+    });
+
+    it('AC-9 : réservation relue `Cancelled` (filet 48 h du PMS) → hold et index retirés sans erreur', async () => {
+      const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+      deps.read.mockResolvedValue(issuedHold(10 * WINDOW_MS));
+      routePms(deps, { status: 5, payment: payment() });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.release).toHaveBeenCalledWith(RESERVATION_ID);
+      expect(error).not.toHaveBeenCalled();
+      // Inutile de lire le paiement d'une réservation déjà libérée.
+      expect(deps.get).not.toHaveBeenCalledWith(paymentPath, expect.anything());
+    });
+
+    it('réservation relue `Confirmed` → hold retiré de l’index, jamais annulé', async () => {
+      deps.read.mockResolvedValue(issuedHold(10 * WINDOW_MS));
+      routePms(deps, { status: 2, payment: payment() });
+
+      await sweeper.sweep();
+
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      expect(deps.release).not.toHaveBeenCalled();
+    });
+
+    it('AC-4 : annulation refusée par le PMS (libération Stripe en échec) → report, hold conservé', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, { payment: payment() });
+      deps.post.mockRejectedValue(
+        new PmsUnavailableError('502', undefined, {
+          status: 502,
+          body: {
+            success: false,
+            errors: ['The payment of this reservation could not be released'],
+          },
+        }),
+      );
+
+      await sweeper.sweep();
+
+      expect(deps.release).not.toHaveBeenCalled();
+      expect(deps.reschedule).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        expect.any(Number),
       );
     });
   });

@@ -11,6 +11,7 @@ import {
 } from '../../integration/pms/pms-errors';
 import {
   classifyConfirmFailure,
+  CONFIRM_DEBIT_KEY,
   CONFIRM_REASON_KEY,
   PMS_CONFIRMATION_ENDPOINTS,
   toConfirmException,
@@ -71,6 +72,11 @@ describe('classifyConfirmFailure', () => {
       'reservation-cancelled',
     ],
     [
+      'chambre devenue indisponible (409, #4 AC-7)',
+      refused(409, 'Room is no longer available for this reservation'),
+      'room-unavailable',
+    ],
+    [
       'motif inconnu (400)',
       refused(400, 'Something else entirely'),
       'rejected',
@@ -111,6 +117,19 @@ describe('classifyConfirmFailure', () => {
     expect(classifyConfirmFailure(refused(429, 'x'))).toBeNull();
   });
 
+  /**
+   * #4 : la chambre était prise mais Stripe n'a pas pu libérer le paiement ; rien n'a été écrit et le
+   * rejeu est sûr. C'est une panne (503, « Réessayer »), jamais un refus définitif : affirmer
+   * « aucun débit conservé » serait prématuré tant que la libération n'a pas abouti.
+   */
+  it('502 « paiement non libéré » (#4) reste une panne rejouable', () => {
+    expect(
+      classifyConfirmFailure(
+        gateway('The payment of this reservation could not be released'),
+      ),
+    ).toBeNull();
+  });
+
   it('401/403 sur /confirm vise la CLÉ DE SERVICE, pas la session : panne, pas « reconnectez-vous »', () => {
     // Renvoyer le voyageur à l'identification ne corrigerait rien : c'est la configuration du BFF.
     expect(classifyConfirmFailure(refused(401, 'Invalid key'))).toBeNull();
@@ -128,6 +147,7 @@ describe('toConfirmException', () => {
     ['amount-mismatch', ConflictException],
     ['authorisation-expired', ConflictException],
     ['reservation-cancelled', ConflictException],
+    ['room-unavailable', ConflictException],
     ['capture-failed', BadGatewayException],
     ['reservation-not-found', NotFoundException],
     // Une réservation d'une autre session : 404, jamais un oracle d'existence (AC-2).
@@ -145,6 +165,29 @@ describe('toConfirmException', () => {
     expect(body.errors[CONFIRM_REASON_KEY]).toEqual([reason]);
     // Message BFF générique, jamais le texte du PMS.
     expect(body.message).not.toMatch(/Reservation|Payment|Authorized/);
+  });
+});
+
+describe('toConfirmException — statut de débit (#4, AC-8)', () => {
+  it.each(['none', 'refunded'] as const)(
+    'porte le statut de débit « %s » à côté du motif',
+    (debit) => {
+      const body = toConfirmException(
+        'room-unavailable',
+        debit,
+      ).getResponse() as {
+        errors: Record<string, string[]>;
+      };
+      expect(body.errors[CONFIRM_REASON_KEY]).toEqual(['room-unavailable']);
+      expect(body.errors[CONFIRM_DEBIT_KEY]).toEqual([debit]);
+    },
+  );
+
+  it('n’invente aucun statut de débit quand il n’est pas connu', () => {
+    const body = toConfirmException('room-unavailable').getResponse() as {
+      errors: Record<string, string[]>;
+    };
+    expect(body.errors).not.toHaveProperty(CONFIRM_DEBIT_KEY);
   });
 });
 

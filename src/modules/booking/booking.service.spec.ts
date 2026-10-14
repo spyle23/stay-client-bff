@@ -128,6 +128,7 @@ const baseOptions: BookingOptions = {
   pmsCallBudgetMs: 24_750,
   intentReconcileDelayMs: 90_000,
   communicationLocaleTtlSeconds: 172_800,
+  paymentWindowSeconds: 1_800,
 };
 
 /** Doubles injectés — un par dépendance réelle, sans conteneur Nest. */

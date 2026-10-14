@@ -66,12 +66,26 @@ export type ConfirmFailureReason =
   | 'authorisation-expired'
   | 'reservation-not-found'
   | 'reservation-cancelled'
+  | 'room-unavailable'
   | 'not-owner'
   | 'session-invalid'
   | 'rejected';
 
 /** Clé du dictionnaire d'erreurs portant le motif machine (identique à `booking` et `payment`). */
 export const CONFIRM_REASON_KEY = 'reason';
+
+/**
+ * Clé du dictionnaire d'erreurs portant le **statut de débit** (#4, AC-8), lu au PMS :
+ * - `none` : aucun débit conservé (autorisation annulée, jamais capturée, ou aucun paiement) ;
+ * - `refunded` : remboursement intégral émis (AC-5) ;
+ * - `captured` : argent encaissé sur une réservation annulée, sans remboursement (cas que la
+ *   réconciliation signale en `integrity.alert`) : l'écran ne doit surtout pas dire « aucun débit ».
+ * Absente quand le BFF ne l'a pas établi (lecture en échec) : l'écran garde son énoncé par défaut.
+ */
+export const CONFIRM_DEBIT_KEY = 'debit';
+
+/** Statut de débit d'un échec de confirmation (#4, AC-8). */
+export type ConfirmDebitStatus = 'none' | 'refunded' | 'captured';
 
 /** Motifs textuels du PMS, dans l'ordre de spécificité. */
 const PMS_FAILURE_PATTERNS: ReadonlyArray<
@@ -87,6 +101,11 @@ const PMS_FAILURE_PATTERNS: ReadonlyArray<
   [
     /cannot\s+confirm\s+a\s+reservation\s+in\s+status\s+cancelled/i,
     'reservation-cancelled',
+  ],
+  // #4 AC-7 — `ReservationErrors.ConfirmRoomUnavailable` (409) : rien capturé, paiement libéré.
+  [
+    /room\s+is\s+no\s+longer\s+available\s+for\s+this\s+reservation/i,
+    'room-unavailable',
   ],
   [/not\s+authori[sz]ed\s+to\b/i, 'not-owner'],
   [/reservation\s+not\s+found/i, 'reservation-not-found'],
@@ -104,6 +123,8 @@ const REASON_MESSAGES: Record<ConfirmFailureReason, string> = {
     "L'autorisation de paiement a expiré. Aucun débit n'a été conservé.",
   'reservation-not-found': 'Réservation introuvable.',
   'reservation-cancelled': 'Cette réservation a été annulée.',
+  'room-unavailable':
+    "Cette chambre n'est plus disponible pour vos dates : la réservation n'a pas pu être confirmée.",
   'not-owner': 'Réservation introuvable.',
   'session-invalid': 'Session expirée. Identifiez-vous à nouveau.',
   rejected:
@@ -158,11 +179,13 @@ export function classifyConfirmFailure(
 /** Traduit un motif en exception HTTP, motif machine inclus. */
 export function toConfirmException(
   reason: ConfirmFailureReason,
+  debit?: ConfirmDebitStatus,
 ): HttpException {
-  const body = {
-    message: REASON_MESSAGES[reason],
-    errors: { [CONFIRM_REASON_KEY]: [reason] },
-  };
+  const errors: Record<string, string[]> = { [CONFIRM_REASON_KEY]: [reason] };
+  if (debit !== undefined) {
+    errors[CONFIRM_DEBIT_KEY] = [debit];
+  }
+  const body = { message: REASON_MESSAGES[reason], errors };
 
   switch (reason) {
     // États serveur qui interdisent la confirmation : déterministes, réessayer ne changerait rien.
@@ -170,6 +193,7 @@ export function toConfirmException(
     case 'amount-mismatch':
     case 'authorisation-expired':
     case 'reservation-cancelled':
+    case 'room-unavailable':
       return new ConflictException(body);
     // L'échec vient de Stripe : rejouer la confirmation (idempotente) peut aboutir.
     case 'capture-failed':

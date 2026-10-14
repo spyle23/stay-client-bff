@@ -116,6 +116,17 @@ export interface BookingOptions {
    * disparaître **avant** le hold, ce qui reproduirait exactement le défaut corrigé.
    */
   communicationLocaleTtlSeconds: number;
+
+  /**
+   * **Fenêtre de paiement** (secondes, #4 AC-2) : délai, compté depuis l'émission de l'intent, au
+   * bout duquel le balayeur annule une `Pending` dont le formulaire de paiement a été abandonné
+   * (`intentStatus` `requires_payment_method`, `requires_confirmation` ou `requires_action`).
+   *
+   * Défaut 30 min, bornes 10 min–2 h. ⚠️ Ne peut pas dépasser le sursis de l'enregistrement de hold
+   * (`BOOKING_HOLD_GRACE_SECONDS`) : l'enregistrement, qui porte le `sid` exigé par l'annulation,
+   * expirerait avant la fin de la fenêtre et la chambre resterait gelée. Refusé au boot.
+   */
+  paymentWindowSeconds: number;
 }
 
 export const BOOKING_OPTIONS = 'BOOKING_OPTIONS';
@@ -221,8 +232,25 @@ export function resolveBookingOptions(
     604_800, // 7 j
   );
 
+  const paymentWindowSeconds = bounded(
+    env.BOOKING_PAYMENT_WINDOW_SECONDS,
+    1_800,
+    600,
+    7_200,
+  );
+
+  // L'enregistrement de hold est réécrit avec `holdTtlSeconds + holdRecordGraceSeconds` à
+  // l'émission de l'intent : une fenêtre au-delà du sursis le ferait expirer avant l'échéance, et
+  // le balayeur ne pourrait plus annuler (plus de `sid`). Refusé au boot (#4).
+  if (paymentWindowSeconds > holdRecordGraceSeconds) {
+    throw new Error(
+      `BOOKING_PAYMENT_WINDOW_SECONDS (${paymentWindowSeconds}) ne peut pas dépasser la durée de vie de l'enregistrement de hold (BOOKING_HOLD_GRACE_SECONDS = ${holdRecordGraceSeconds}) : le hold expirerait avant la fin de la fenêtre de paiement.`,
+    );
+  }
+
   return {
     maxStayNights: bounded(env.BOOKING_MAX_STAY_NIGHTS, 90, 1, 365),
+    paymentWindowSeconds,
     communicationLocaleTtlSeconds,
     holdTtlSeconds,
     holdRecordGraceSeconds,

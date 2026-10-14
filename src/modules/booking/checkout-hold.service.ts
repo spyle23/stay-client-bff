@@ -115,21 +115,41 @@ if not raw then return 0 end
 local ok, record = pcall(cjson.decode, raw)
 if not ok then return -1 end
 record.paymentStarted = true
+if type(record.paymentStartedAt) ~= 'number' then record.paymentStartedAt = tonumber(ARGV[2]) end
 redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
 return 1`;
 
 /**
- * Retire `paymentStarted`, en un seul pas Redis — miroir exact de la pose.
+ * Retire `paymentStarted` (et l'instant de sa pose), en un seul pas Redis — miroir de la pose.
  *
  * Renvoie `1` si le drapeau a été retiré, `0` si l'enregistrement n'existe pas (rien à faire),
- * `-1` s'il est illisible.
+ * `-1` s'il est illisible, `2` si un intent a été émis : le gel est alors **conservé** (#4, constat
+ * de la livraison de #3), une ligne `Payment` existant côté PMS, carte peut-être retenue.
  */
 export const CLEAR_PAYMENT_STARTED_SCRIPT = `local raw = redis.call('get', KEYS[1])
 if not raw then return 0 end
 local ok, record = pcall(cjson.decode, raw)
 if not ok then return -1 end
+if record.intentIssued == true then return 2 end
 record.paymentStarted = false
+record.paymentStartedAt = nil
 redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
+return 1`;
+
+/**
+ * Report **sans tentative** (#4) : rafraîchit la durée de vie de l'enregistrement et repousse son
+ * échéance d'index. Sert aux attentes légitimes du balayeur (fenêtre de paiement pas encore écoulée,
+ * paiement en cours de traitement, Stripe illisible) : ce ne sont pas des échecs, et les compter
+ * finirait par abandonner un hold qui attend simplement son issue.
+ *
+ * Renvoie `1`, ou `-2` si l'enregistrement a disparu (l'entrée d'index est alors retirée).
+ */
+export const DEFER_SCRIPT = `if not redis.call('get', KEYS[1]) then
+  redis.call('zrem', KEYS[2], ARGV[3])
+  return -2
+end
+redis.call('expire', KEYS[1], ARGV[1])
+redis.call('zadd', KEYS[2], ARGV[2], ARGV[3])
 return 1`;
 
 /**
@@ -146,6 +166,8 @@ local ok, record = pcall(cjson.decode, raw)
 if not ok then return -1 end
 record.paymentStarted = true
 record.intentIssued = true
+if type(record.paymentStartedAt) ~= 'number' then record.paymentStartedAt = tonumber(ARGV[2]) end
+if type(record.intentIssuedAt) ~= 'number' then record.intentIssuedAt = tonumber(ARGV[2]) end
 redis.call('set', KEYS[1], cjson.encode(record), 'EX', ARGV[1])
 return 1`;
 
@@ -221,6 +243,17 @@ export interface CheckoutHoldRecord {
    * Absent sur un hold antérieur à ce champ : lu comme `false`.
    */
   intentIssued?: boolean;
+  /**
+   * Instant (ms epoch) de la **première** pose du gel (#4). Retiré avec le gel. Repère de la fenêtre
+   * de paiement quand aucun intent n'a été émis (appel d'intent en échec ou réponse perdue).
+   */
+  paymentStartedAt?: number;
+  /**
+   * Instant (ms epoch) de la **première** émission de l'intent (#4) : début de la fenêtre de paiement
+   * (`BOOKING_PAYMENT_WINDOW_SECONDS`). Une réémission ne le repousse pas. Absent sur un hold
+   * antérieur à ce champ.
+   */
+  intentIssuedAt?: number;
   /** Nombre de passes de balayage infructueuses. */
   attempts: number;
 }
@@ -445,6 +478,7 @@ export class CheckoutHoldService {
         1,
         HOLD_KEY_PREFIX + reservationId,
         this.recordTtlSeconds,
+        Date.now(),
       ),
     );
 
@@ -477,6 +511,7 @@ export class CheckoutHoldService {
         1,
         HOLD_KEY_PREFIX + reservationId,
         this.recordTtlSeconds,
+        Date.now(),
       ),
     );
     if (applied !== 1) {
@@ -499,10 +534,17 @@ export class CheckoutHoldService {
    * immobilisée pour toujours, le balayeur ne touchant plus jamais un hold marqué. Le retrait suit
    * le même patron atomique que la pose : la modification s'exécute dans Redis.
    *
-   * `intentIssued` n'est **jamais** retiré : un intent émis plus tôt garde sa ligne `Payment`.
+   * `intentIssued` n'est **jamais** retiré, et depuis #4 il **garde le gel** (`'kept'`) : un intent
+   * émis plus tôt garde sa ligne `Payment`, et c'est le balayeur qui en décide d'après l'état lu au
+   * PMS (fenêtre de paiement, AC-2/AC-3).
+   *
+   * Renvoie `'cleared'` (gel retiré), `'kept'` (intent émis, gel conservé) ou `'absent'` (hold absent
+   * ou illisible : rien à relâcher).
    */
-  async clearPaymentStarted(reservationId: string): Promise<void> {
-    await this.guard(() =>
+  async clearPaymentStarted(
+    reservationId: string,
+  ): Promise<'cleared' | 'kept' | 'absent'> {
+    const result = await this.guard(() =>
       this.redis.raw.eval(
         CLEAR_PAYMENT_STARTED_SCRIPT,
         1,
@@ -510,6 +552,31 @@ export class CheckoutHoldService {
         this.recordTtlSeconds,
       ),
     );
+    if (result === 1) {
+      return 'cleared';
+    }
+    return result === 2 ? 'kept' : 'absent';
+  }
+
+  /**
+   * Repousse l'échéance d'un hold **sans compter de tentative** et rafraîchit la durée de vie de
+   * son enregistrement (#4, voir `DEFER_SCRIPT`).
+   *
+   * Renvoie `false` si l'enregistrement a disparu (l'entrée d'index est alors retirée).
+   */
+  async defer(reservationId: string, nextAt: number): Promise<boolean> {
+    const result = await this.guard(() =>
+      this.redis.raw.eval(
+        DEFER_SCRIPT,
+        2,
+        HOLD_KEY_PREFIX + reservationId,
+        HOLD_INDEX_KEY,
+        this.recordTtlSeconds,
+        nextAt,
+        reservationId,
+      ),
+    );
+    return result === 1;
   }
 
   /**

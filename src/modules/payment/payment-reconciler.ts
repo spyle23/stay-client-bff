@@ -393,6 +393,15 @@ export class PaymentReconciler implements OnModuleInit, OnModuleDestroy {
       );
     } catch (err) {
       const reason = classifyConfirmFailure(err);
+      if (reason === 'room-unavailable') {
+        // #4 AC-7 : chambre prise, rien capturé, paiement libéré (ou remboursé) et `Pending`
+        // annulée par le PMS. Ni panne ni refus à mémoriser : la passe suivante relit `Cancelled`.
+        this.logger.warn(
+          `[réconciliation ${passId}] Réservation ${id} : chambre devenue indisponible, paiement libéré par le PMS.`,
+        );
+        await this.waitAgain(candidate);
+        return;
+      }
       if (reason !== null && DETERMINISTIC_REFUSALS.has(reason)) {
         record.refusal = reason as DeterministicRefusal;
         this.alert(candidate, 'deterministic-refusal', true);

@@ -9,6 +9,7 @@ import {
   CLEAR_PAYMENT_STARTED_SCRIPT,
   COMPARE_AND_DELETE_SCRIPT,
   COUNT_AND_RESCHEDULE_SCRIPT,
+  DEFER_SCRIPT,
   DROP_INDEXED_SCRIPT,
   HOLD_INDEX_KEY,
   HOLD_KEY_PREFIX,
@@ -45,6 +46,7 @@ const options: BookingOptions = {
   pmsCallBudgetMs: 24_750,
   intentReconcileDelayMs: 90_000,
   communicationLocaleTtlSeconds: 172_800,
+  paymentWindowSeconds: 1_800,
 };
 
 const stay: StayFingerprint = {
@@ -115,7 +117,20 @@ class ScriptedRedis extends FakeRedis {
         } catch {
           return -1;
         }
-        record.paymentStarted = script === MARK_PAYMENT_STARTED_SCRIPT;
+        if (script === MARK_PAYMENT_STARTED_SCRIPT) {
+          record.paymentStarted = true;
+          // Instant de la PREMIÈRE pose : une relance ne repousse pas la fenêtre de paiement (#4).
+          if (typeof record.paymentStartedAt !== 'number') {
+            record.paymentStartedAt = Number(argv[1]);
+          }
+        } else {
+          // #4 : un intent émis garde son gel (une ligne `Payment` existe côté PMS).
+          if (record.intentIssued === true) {
+            return 2;
+          }
+          record.paymentStarted = false;
+          delete record.paymentStartedAt;
+        }
         await super.set(keys[0], JSON.stringify(record), 'EX', Number(argv[0]));
         return 1;
       }
@@ -133,7 +148,23 @@ class ScriptedRedis extends FakeRedis {
         }
         record.paymentStarted = true;
         record.intentIssued = true;
+        if (typeof record.paymentStartedAt !== 'number') {
+          record.paymentStartedAt = Number(argv[1]);
+        }
+        if (typeof record.intentIssuedAt !== 'number') {
+          record.intentIssuedAt = Number(argv[1]);
+        }
         await super.set(keys[0], JSON.stringify(record), 'EX', Number(argv[0]));
+        return 1;
+      }
+      case DEFER_SCRIPT: {
+        // Report SANS compter de tentative (#4) : TTL rafraîchi, échéance d'index repoussée.
+        if ((await super.get(keys[0])) === null) {
+          await super.zrem(keys[1], String(argv[2]));
+          return -2;
+        }
+        await super.pexpire(keys[0], Number(argv[0]) * 1000);
+        await super.zadd(keys[1], Number(argv[1]), String(argv[2]));
         return 1;
       }
       case COUNT_AND_RESCHEDULE_SCRIPT: {
@@ -505,14 +536,57 @@ describe('CheckoutHoldService', () => {
         expect((await service.read(RESERVATION_ID))?.paymentStarted).toBe(true);
       });
 
-      it('clearPaymentStarted ne retire jamais intentIssued (le paiement PMS existe)', async () => {
+      /**
+       * Constat de la livraison de #3 (revue ronde 2) : un refus « déterministe » postérieur à
+       * l'émission (devise résolue avant le contrôle « déjà payé » côté PMS) relâchait le gel alors
+       * qu'une ligne `Payment` existait, carte peut-être retenue. Le gel d'un intent émis reste.
+       */
+      it('clearPaymentStarted garde le gel quand un intent a été émis (#4)', async () => {
         await service.markIntentIssued(RESERVATION_ID);
 
-        await service.clearPaymentStarted(RESERVATION_ID);
+        await expect(service.clearPaymentStarted(RESERVATION_ID)).resolves.toBe(
+          'kept',
+        );
+
+        const record = await service.read(RESERVATION_ID);
+        expect(record?.paymentStarted).toBe(true);
+        expect(record?.intentIssued).toBe(true);
+      });
+
+      it('clearPaymentStarted relâche le gel sans intent émis, et oublie son instant', async () => {
+        await service.markPaymentStarted(RESERVATION_ID);
+
+        await expect(service.clearPaymentStarted(RESERVATION_ID)).resolves.toBe(
+          'cleared',
+        );
 
         const record = await service.read(RESERVATION_ID);
         expect(record?.paymentStarted).toBe(false);
-        expect(record?.intentIssued).toBe(true);
+        expect(record?.paymentStartedAt).toBeUndefined();
+      });
+
+      it('date la PREMIÈRE émission de l’intent : une réémission ne repousse pas la fenêtre', async () => {
+        const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+        await service.markIntentIssued(RESERVATION_ID);
+        now.mockReturnValue(2_000_000);
+        await service.markIntentIssued(RESERVATION_ID);
+        now.mockRestore();
+
+        const record = await service.read(RESERVATION_ID);
+        expect(record?.intentIssuedAt).toBe(1_000_000);
+        expect(record?.paymentStartedAt).toBe(1_000_000);
+      });
+
+      it('markPaymentStarted date la première pose du gel', async () => {
+        const now = jest.spyOn(Date, 'now').mockReturnValue(5_000);
+        await service.markPaymentStarted(RESERVATION_ID);
+        now.mockReturnValue(9_000);
+        await service.markPaymentStarted(RESERVATION_ID);
+        now.mockRestore();
+
+        const record = await service.read(RESERVATION_ID);
+        expect(record?.paymentStartedAt).toBe(5_000);
+        expect(record?.intentIssuedAt).toBeUndefined();
       });
 
       it('ÉCHOUE (503) quand le hold est absent ou illisible', async () => {
@@ -553,6 +627,40 @@ describe('CheckoutHoldService', () => {
       await expect(service.dueHolds(next + 1, 10)).resolves.toEqual([
         RESERVATION_ID,
       ]);
+    });
+
+    describe('report sans tentative (#4, fenêtre de paiement)', () => {
+      it('defer repousse l’échéance d’index SANS compter de tentative', async () => {
+        const next = redis.now + 600_000;
+        await expect(service.defer(RESERVATION_ID, next)).resolves.toBe(true);
+
+        expect((await service.read(RESERVATION_ID))?.attempts).toBe(0);
+        await expect(service.dueHolds(redis.now + 1, 10)).resolves.toEqual([]);
+        await expect(service.dueHolds(next + 1, 10)).resolves.toEqual([
+          RESERVATION_ID,
+        ]);
+      });
+
+      it('defer rafraîchit la durée de vie de l’enregistrement (attente au-delà du sursis)', async () => {
+        redis.advance(3_000_000);
+        await service.defer(RESERVATION_ID, redis.now + 60_000);
+
+        expect(redis.ttlMsOf(HOLD_KEY_PREFIX + RESERVATION_ID)).toBe(
+          service.recordTtlSeconds * 1000,
+        );
+      });
+
+      it('defer d’un hold disparu renvoie false et retire l’entrée d’index', async () => {
+        await redis.zadd(HOLD_INDEX_KEY, 1, 'fantôme');
+        await expect(service.defer('fantôme', 1_000)).resolves.toBe(false);
+        await expect(redis.zcard(HOLD_INDEX_KEY)).resolves.toBe(1); // le hold réel reste
+      });
+
+      it('ne relit jamais l’enregistrement côté client', async () => {
+        const get = jest.spyOn(redis, 'get');
+        await service.defer(RESERVATION_ID, 1_000);
+        expect(get).not.toHaveBeenCalledWith(HOLD_KEY_PREFIX + RESERVATION_ID);
+      });
     });
 
     it('reschedule d’un hold disparu renvoie null et retire l’entrée d’index', async () => {

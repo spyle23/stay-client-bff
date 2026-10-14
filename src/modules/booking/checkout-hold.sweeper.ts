@@ -9,8 +9,10 @@ import {
 import { SchedulerRegistry } from '@nestjs/schedule';
 import type { PmsRequestContext } from '../../integration/pms/pms-client.service';
 import { PmsClientService } from '../../integration/pms/pms-client.service';
+import { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
 import { SessionService } from '../auth/session.service';
 import type { components } from '../../types/generated/pms';
+import { PMS_CONFIRMATION_ENDPOINTS } from '../payment/confirm-errors';
 import {
   isPmsGuid,
   PMS_RESERVATION_ENDPOINTS,
@@ -25,6 +27,32 @@ import {
 } from './checkout-hold.service';
 
 type PmsReservation = components['schemas']['RoomReservationDto'];
+type PmsReservationPayment =
+  components['schemas']['ReservationPaymentStateDto'];
+type PmsPaymentState = components['schemas']['PaymentStateDto'];
+
+/**
+ * `intentStatus` d'un formulaire **abandonné** (#4, AC-2) : rien n'est retenu sur la carte, le
+ * voyageur n'a pas (ou plus) d'autorisation en cours. Au-delà de la fenêtre de paiement, la `Pending`
+ * est annulée ; le PMS annule l'intent chez Stripe avant la transition (AC-4). `canceled` en fait
+ * partie : un intent déjà annulé chez Stripe ne retient rien non plus.
+ */
+const PAYMENT_ABANDONED: ReadonlySet<string> = new Set([
+  'requires_payment_method',
+  'requires_confirmation',
+  'requires_action',
+  'canceled',
+]);
+
+/**
+ * `intentStatus` d'un argent **engagé** (#4, AC-3) : retenu (capture manuelle, D8) ou encaissé. Le
+ * cas relève de la confirmation (#3) ou de la réconciliation (#5), inscrite à l'émission de
+ * l'intent : le balayeur n'y touche plus et retire le hold de son index.
+ */
+const PAYMENT_ENGAGED: ReadonlySet<string> = new Set([
+  'requires_capture',
+  'succeeded',
+]);
 
 /** `ReservationStatus` côté PMS (Pending=1, Confirmed=2, CheckedIn=3, CheckedOut=4, Cancelled=5, NoShow=6). */
 const STATUS_PENDING = PMS_STATUS_PENDING;
@@ -39,8 +67,11 @@ const KNOWN_STATUSES: ReadonlySet<number> = new Set([1, 2, 3, 4, 5, 6]);
 
 const INTERVAL_NAME = 'booking-checkout-hold-sweeper';
 
-/** Appels PMS au pire par élément traité : la relecture puis l'annulation. */
-const PMS_CALLS_PER_ITEM = 2;
+/**
+ * Appels PMS au pire par élément traité : la relecture de la réservation, celle de son paiement
+ * (hold à paiement engagé, #4), puis l'annulation.
+ */
+const PMS_CALLS_PER_ITEM = 3;
 
 /**
  * Plafond du TTL du verrou de passe (ms). Au-delà, un processus mort priverait la plateforme de
@@ -65,13 +96,29 @@ const MY_RESERVATIONS_PAGE_SIZE = 100;
  * **Annuler une réservation payée est un incident de production ; garder une chambre gelée
  * quelques minutes de trop est une gêne.** En cas de doute, le balayeur **ne libère pas**. Quatre
  * gardes, dans cet ordre :
- * 1. un hold marqué `paymentStarted` (posé par la story 3.1) n'est **jamais** balayé ;
+ * 1. un hold marqué `paymentStarted` (posé par la story 3.1) n'est balayé que sur la foi du
+ *    **paiement lu au PMS** (#4, voir « Fenêtre de paiement » ci-dessous) ;
  * 2. la réservation est **relue au PMS** et n'est annulée que si son statut est `Pending` ;
  * 3. un statut **non reconnu** (`undefined`, `null`, code hors table, corps illisible) est un
  *    doute : report, jamais annulation — seul un statut *reconnu* et non-`Pending` autorise à
  *    retirer le hold sans annuler ;
  * 4. l'enregistrement est **relu juste avant l'annulation** : un paiement a pu démarrer pendant
  *    l'aller-retour PMS de l'étape 2, et la décision serait alors prise sur un état périmé.
+ *
+ * ## Fenêtre de paiement (#4, story 3.3)
+ *
+ * Un hold `paymentStarted` **reste dans l'index** jusqu'à son issue (fin du `forget` immédiat, qui
+ * laissait un formulaire abandonné geler la chambre jusqu'au filet 48 h du PMS). À son échéance, le
+ * balayeur relit la réservation (JWT du voyageur) puis son paiement (`GET /reservations/{id}/payment`,
+ * route de service de #153, sans session) :
+ * - `requires_payment_method`, `requires_confirmation`, `requires_action` ou `canceled`, et
+ *   `BOOKING_PAYMENT_WINDOW_SECONDS` écoulé depuis l'émission de l'intent : annulation (le PMS
+ *   annule l'intent chez Stripe avant la transition, AC-2/AC-4) ; avant cette échéance, attente ;
+ * - `requires_capture` ou `succeeded` : jamais d'annulation, le hold sort de l'index (AC-3) ;
+ * - `processing`, Stripe illisible, statut inconnu, intent émis sans paiement lu : doute, report ;
+ * - aucun intent émis ni paiement (appel d'intent en échec) : annulation à la fin de la fenêtre,
+ *   comptée depuis la pose du gel, bien au-delà de tout appel encore en vol.
+ * Les attentes ne comptent pas de tentative (`CheckoutHoldService.defer`) : ce ne sont pas des échecs.
  *
  * ## Deux types d'entrées dans un même index
  *
@@ -112,6 +159,7 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
     private readonly holds: CheckoutHoldService,
     private readonly sessions: SessionService,
     private readonly pms: PmsClientService,
+    private readonly serviceKey: ServiceKeyProvider,
     private readonly scheduler: SchedulerRegistry,
     @Inject(BOOKING_OPTIONS) private readonly options: BookingOptions,
   ) {}
@@ -233,16 +281,6 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      if (record.paymentStarted) {
-        // FR-14 : un paiement est engagé. On sort de l'index — le cycle de vie appartient
-        // désormais au flux de paiement/confirmation (story 3.1).
-        this.logger.log(
-          `[passe ${passId}] Réservation ${reservationId} : paiement engagé, hold non libéré.`,
-        );
-        await this.holds.forget(reservationId);
-        return;
-      }
-
       if (record.attempts >= this.options.sweeperMaxAttempts) {
         // Abandon **bruyant** : la chambre reste immobilisée jusqu'au filet 48 h du PMS (D3).
         this.logger.error(
@@ -256,30 +294,19 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
 
       const reservation = await this.readReservation(record, passId);
       const status = reservation?.status ?? null;
+      const settled = await this.settleUnlessPending(
+        reservationId,
+        status,
+        passId,
+      );
+      if (settled) {
+        return;
+      }
 
-      if (typeof status !== 'number' || !KNOWN_STATUSES.has(status)) {
-        // Statut absent, `null`, ou code que le BFF ne sait pas interpréter : **doute**, donc
-        // report. Le laisser tomber en « retrait sans annulation » abandonnerait silencieusement
-        // une chambre potentiellement gelée, sans la moindre alerte.
-        await this.postponeHold(
-          reservationId,
-          passId,
-          `statut non interprétable (${describeStatus(status)})`,
-        );
-        return;
-      }
-      if (status === STATUS_CANCELLED || status === STATUS_NO_SHOW) {
-        // Déjà libérée par ailleurs : plus rien à tenir, et la mémoire d'idempotence doit partir
-        // (un rejeu de création ne doit pas resservir une réservation morte).
-        await this.holds.release(reservationId);
-        return;
-      }
-      if (status !== STATUS_PENDING) {
-        // `Confirmed` / `CheckedIn` / `CheckedOut` : réservation aboutie — ne jamais y toucher.
-        this.logger.log(
-          `[passe ${passId}] Réservation ${reservationId} : statut ${status}, hold retiré sans annulation.`,
-        );
-        await this.holds.forget(reservationId);
+      if (record.paymentStarted || record.intentIssued === true) {
+        // FR-14 : un paiement a pu être engagé. La décision se prend sur le paiement lu au PMS,
+        // jamais sur le seul drapeau (#4).
+        await this.processPaymentHold(record, passId);
         return;
       }
 
@@ -297,11 +324,15 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
         return;
       }
       if (fresh.paymentStarted) {
+        // #4 : le hold reste suivi ; la passe suivante lira le paiement au PMS.
         this.logger.log(
           `[passe ${passId}] Réservation ${reservationId} : paiement engagé pendant la passe, ` +
             'annulation abandonnée.',
         );
-        await this.holds.forget(reservationId);
+        await this.wait(
+          reservationId,
+          Date.now() + this.options.sweeperRetryDelayMs,
+        );
         return;
       }
 
@@ -313,6 +344,181 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
     } catch (err) {
       await this.postponeHold(reservationId, passId, message(err));
     }
+  }
+
+  /**
+   * Issue d'un hold dont la réservation n'est plus `Pending`, ou dont le statut est illisible.
+   * Renvoie `true` si le hold a été traité (rien d'autre à faire), `false` pour une `Pending`.
+   */
+  private async settleUnlessPending(
+    reservationId: string,
+    status: number | null,
+    passId: string,
+  ): Promise<boolean> {
+    if (typeof status !== 'number' || !KNOWN_STATUSES.has(status)) {
+      // Statut absent, `null`, ou code que le BFF ne sait pas interpréter : **doute**, donc
+      // report. Le laisser tomber en « retrait sans annulation » abandonnerait silencieusement
+      // une chambre potentiellement gelée, sans la moindre alerte.
+      await this.postponeHold(
+        reservationId,
+        passId,
+        `statut non interprétable (${describeStatus(status)})`,
+      );
+      return true;
+    }
+    if (status === STATUS_CANCELLED || status === STATUS_NO_SHOW) {
+      // Déjà libérée par ailleurs (voyageur, back-office, webhook `canceled`, filet 48 h du PMS) :
+      // plus rien à tenir, et la mémoire d'idempotence doit partir (un rejeu de création ne doit
+      // pas resservir une réservation morte).
+      await this.holds.release(reservationId);
+      return true;
+    }
+    if (status !== STATUS_PENDING) {
+      // `Confirmed` / `CheckedIn` / `CheckedOut` : réservation aboutie — ne jamais y toucher.
+      this.logger.log(
+        `[passe ${passId}] Réservation ${reservationId} : statut ${status}, hold retiré sans annulation.`,
+      );
+      await this.holds.forget(reservationId);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Hold d'une `Pending` dont un paiement a pu être engagé (#4, AC-2/AC-3) : décision sur le
+   * paiement lu au PMS. Les erreurs remontent à `processOne`, qui reporte en comptant la tentative.
+   */
+  private async processPaymentHold(
+    record: CheckoutHoldRecord,
+    passId: string,
+  ): Promise<void> {
+    const id = record.reservationId;
+    const payment = await this.readPayment(id, passId);
+    const now = Date.now();
+    const deadline = this.paymentDeadline(record, payment);
+
+    if (payment === null) {
+      if (record.intentIssued === true) {
+        // Le PMS a rendu un intent, donc créé une ligne `Payment` : ne pas la lire est un doute.
+        this.logger.warn(
+          `[passe ${passId}] Réservation ${id} : intent émis mais aucun paiement lu au PMS — report.`,
+        );
+        await this.wait(id, now + this.options.sweeperRetryDelayMs);
+        return;
+      }
+      await this.cancelAfterWindow(
+        record,
+        deadline,
+        now,
+        passId,
+        'aucun intent émis',
+      );
+      return;
+    }
+
+    if (payment.stripeReadable !== true) {
+      this.logger.warn(
+        `[passe ${passId}] Réservation ${id} : paiement illisible chez Stripe — report, jamais d'annulation.`,
+      );
+      await this.wait(id, now + this.options.sweeperRetryDelayMs);
+      return;
+    }
+
+    const intentStatus = payment.intentStatus ?? '';
+    if (PAYMENT_ENGAGED.has(intentStatus)) {
+      this.logger.log(
+        `[passe ${passId}] Réservation ${id} : paiement ${intentStatus}, laissé à la confirmation ` +
+          'et à la réconciliation — hold retiré de l’index sans annulation.',
+      );
+      await this.holds.forget(id);
+      return;
+    }
+    if (PAYMENT_ABANDONED.has(intentStatus)) {
+      await this.cancelAfterWindow(
+        record,
+        deadline,
+        now,
+        passId,
+        `intent ${intentStatus}`,
+      );
+      return;
+    }
+
+    // `processing` (issue Stripe en cours), ou statut que le BFF ne sait pas interpréter : doute.
+    this.logger.warn(
+      `[passe ${passId}] Réservation ${id} : intent « ${intentStatus || 'absent'} », issue incertaine — report.`,
+    );
+    await this.wait(id, now + this.options.sweeperRetryDelayMs);
+  }
+
+  /**
+   * Annule la `Pending` une fois la fenêtre de paiement écoulée, sinon attend son échéance.
+   * L'annulation passe par le JWT du propriétaire ; le PMS libère le paiement chez Stripe AVANT la
+   * transition, et refuse (502) si Stripe échoue : `processOne` reporte alors la tentative (AC-4).
+   */
+  private async cancelAfterWindow(
+    record: CheckoutHoldRecord,
+    deadline: number,
+    now: number,
+    passId: string,
+    cause: string,
+  ): Promise<void> {
+    const id = record.reservationId;
+    if (now < deadline) {
+      await this.wait(id, deadline);
+      return;
+    }
+    await this.cancelReservation(record.sid, id, passId);
+    await this.holds.release(id);
+    this.logger.log(
+      `[passe ${passId}] Réservation ${id} libérée : fenêtre de paiement écoulée (${cause}).`,
+    );
+  }
+
+  /**
+   * Fin de la fenêtre de paiement (ms epoch). Début : première émission de l'intent, sinon création
+   * du paiement au PMS (hold antérieur au champ), sinon pose du gel, sinon échéance du hold.
+   */
+  private paymentDeadline(
+    record: CheckoutHoldRecord,
+    payment: PmsPaymentState | null,
+  ): number {
+    const createdAt = payment?.createdAt ? Date.parse(payment.createdAt) : NaN;
+    const start =
+      finite(record.intentIssuedAt) ??
+      (Number.isFinite(createdAt) ? createdAt : undefined) ??
+      finite(record.paymentStartedAt) ??
+      record.expiresAt;
+    return start + this.options.paymentWindowSeconds * 1000;
+  }
+
+  /** Attente sans tentative ; un enregistrement disparu entre-temps est signalé. */
+  private async wait(reservationId: string, nextAt: number): Promise<void> {
+    const kept = await this.holds.defer(reservationId, nextAt);
+    if (!kept) {
+      this.logger.error(
+        `Réservation ${reservationId} : enregistrement de hold disparu pendant l'attente de son ` +
+          'paiement — la chambre peut rester immobilisée jusqu’au filet du PMS.',
+      );
+    }
+  }
+
+  /** Dernier paiement Stripe de la réservation, lu par la route de service (#153), ou `null`. */
+  private async readPayment(
+    reservationId: string,
+    passId: string,
+  ): Promise<PmsPaymentState | null> {
+    const path = PMS_CONFIRMATION_ENDPOINTS.payment(reservationId);
+    const res = await this.pms.get<PmsReservationPayment>(
+      path,
+      this.serviceKey.serviceContext('GET', path, {
+        correlationId: `sweeper-${passId}`,
+      }),
+    );
+    if (!res.data) {
+      throw new Error('réponse de paiement vide');
+    }
+    return res.data.payment ?? null;
   }
 
   /**
@@ -600,4 +806,11 @@ function describeStatus(status: number | null): string {
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : 'erreur inconnue';
+}
+
+/** Nombre fini, sinon `undefined` (champ absent d'un hold antérieur, valeur corrompue). */
+function finite(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
 }

@@ -117,6 +117,29 @@ const heldRecord = (
   ...overrides,
 });
 
+/** `GET /reservations/{id}/payment` (#153) : `status` = `PaymentStatus` du PMS (Refunded = 6). */
+const paymentState = (
+  payment: { status: number; intentStatus?: string | null } | null,
+) => ({
+  success: true,
+  data: {
+    reservationId: RESERVATION_ID,
+    payment:
+      payment === null
+        ? null
+        : {
+            paymentId: '44444444-4444-4444-8444-444444444444',
+            amount: 183,
+            currency: 'EUR',
+            stripeReadable: true,
+            createdAt: '2026-09-01T09:00:00Z',
+            paidAt: null,
+            intentStatus: 'canceled',
+            ...payment,
+          },
+  },
+});
+
 /** Réponse PMS de la confirmation (#152) : montants en unités MAJEURES, devise en majuscules. */
 const pmsConfirmation = (overrides: Record<string, unknown> = {}) => ({
   success: true,
@@ -143,7 +166,7 @@ describe('PaymentService.confirm', () => {
   let service: PaymentService;
   let redis: FakeRedis;
   let calls: string[];
-  let pms: { post: jest.Mock };
+  let pms: { post: jest.Mock; get: jest.Mock };
   let booking: { getReservation: jest.Mock };
   let holds: {
     read: jest.Mock;
@@ -188,6 +211,8 @@ describe('PaymentService.confirm', () => {
         calls.push(`pms.post ${path}`);
         return Promise.resolve(pmsConfirmation());
       }),
+      // Lecture de service du paiement (#153), lue pour énoncer le statut de débit d'un échec (#4).
+      get: jest.fn().mockResolvedValue(paymentState(null)),
     };
     let confirmed = false;
     pms.post.mockImplementation((path: string) => {
@@ -767,6 +792,127 @@ describe('PaymentService.confirm', () => {
       const { type } = await reasonOf();
 
       expect(type).toBeInstanceOf(ServiceUnavailableException);
+    });
+  });
+
+  /**
+   * #4 (story 3.3) AC-7 / AC-8 — chambre devenue indisponible avant la capture : le PMS n'a rien
+   * capturé, a libéré le paiement et annulé la `Pending`. Le BFF classe `room-unavailable` et énonce
+   * le statut de débit lu au PMS (route de service) : jamais deviné.
+   */
+  describe('chambre devenue indisponible (#4, AC-7, AC-8)', () => {
+    const roomTaken = () =>
+      new PmsRequestError('Le PMS a renvoyé le statut 409.', 409, {
+        errors: ['Room is no longer available for this reservation'],
+      });
+
+    const failure = async () => {
+      const err: unknown = await service
+        .confirm(session, RESERVATION_ID)
+        .catch((e: unknown) => e);
+      const response = (
+        err as { getResponse?: () => { errors?: Record<string, string[]> } }
+      ).getResponse?.();
+      return { err, errors: response?.errors ?? {} };
+    };
+
+    it('409 du PMS → room-unavailable (409), autorisation libérée : « aucun débit »', async () => {
+      pms.post.mockRejectedValueOnce(roomTaken());
+      pms.get.mockResolvedValue(paymentState({ status: 5 }));
+
+      const { err, errors } = await failure();
+
+      expect(err).toBeInstanceOf(ConflictException);
+      expect(errors.reason).toEqual(['room-unavailable']);
+      expect(errors.debit).toEqual(['none']);
+    });
+
+    it('AC-5 : argent déjà encaissé puis remboursé → « remboursement intégral émis »', async () => {
+      pms.post.mockRejectedValueOnce(roomTaken());
+      pms.get.mockResolvedValue(
+        paymentState({ status: 6, intentStatus: 'succeeded' }),
+      );
+
+      const { errors } = await failure();
+
+      expect(errors.reason).toEqual(['room-unavailable']);
+      expect(errors.debit).toEqual(['refunded']);
+    });
+
+    it('lit le paiement par la route de service, jamais avec un Bearer', async () => {
+      pms.post.mockRejectedValueOnce(roomTaken());
+
+      await failure();
+
+      expect(pms.get).toHaveBeenCalledWith(
+        `/reservations/${RESERVATION_ID}/payment`,
+        expect.objectContaining({
+          headers: { 'X-Service-Key': 'svc-key-test' },
+        }),
+      );
+      const [, ctx] = pms.get.mock.calls[0] as [
+        string,
+        Record<string, unknown>,
+      ];
+      expect(ctx).not.toHaveProperty('bearerToken');
+    });
+
+    it('lecture du paiement en échec : le motif reste, aucun statut de débit inventé', async () => {
+      pms.post.mockRejectedValueOnce(roomTaken());
+      pms.get.mockRejectedValue(new PmsUnavailableError('down'));
+
+      const { err, errors } = await failure();
+
+      expect(err).toBeInstanceOf(ConflictException);
+      expect(errors.reason).toEqual(['room-unavailable']);
+      expect(errors).not.toHaveProperty('debit');
+    });
+
+    it('la réservation est morte : le hold est libéré (best-effort), jamais seulement oublié', async () => {
+      pms.post.mockRejectedValueOnce(roomTaken());
+
+      await failure();
+
+      expect(holds.release).toHaveBeenCalledWith(RESERVATION_ID);
+    });
+
+    it('libération du hold en panne : le motif est quand même rendu', async () => {
+      pms.post.mockRejectedValueOnce(roomTaken());
+      holds.release.mockRejectedValue(new ServiceUnavailableException());
+
+      const { errors } = await failure();
+
+      expect(errors.reason).toEqual(['room-unavailable']);
+    });
+
+    it.each([
+      [5, 'none'],
+      [6, 'refunded'],
+      [3, 'captured'],
+    ])(
+      'réservation annulée relue (paiement %i) → reservation-cancelled, débit « %s »',
+      async (status, debit) => {
+        booking.getReservation.mockResolvedValue(
+          reservation({ status: 'Cancelled' }),
+        );
+        pms.get.mockResolvedValue(paymentState({ status }));
+
+        const { errors } = await failure();
+
+        expect(errors.reason).toEqual(['reservation-cancelled']);
+        expect(errors.debit).toEqual([debit]);
+        expect(pms.post).not.toHaveBeenCalled();
+      },
+    );
+
+    it('réservation annulée sans aucun paiement → « aucun débit »', async () => {
+      booking.getReservation.mockResolvedValue(
+        reservation({ status: 'Cancelled' }),
+      );
+
+      const { errors } = await failure();
+
+      expect(errors.debit).toEqual(['none']);
     });
   });
 

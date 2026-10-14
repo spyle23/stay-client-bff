@@ -24,6 +24,7 @@ import type {
 } from '../booking/dto/reservation.dto';
 import {
   classifyConfirmFailure,
+  type ConfirmDebitStatus,
   confirmIdempotencyKey,
   PMS_CONFIRMATION_ENDPOINTS,
   toConfirmException,
@@ -42,6 +43,12 @@ import { PaymentReconcileStore } from './reconcile.store';
 
 type PmsPaymentIntent = components['schemas']['PaymentIntentResultDto'];
 type PmsConfirmation = components['schemas']['ConfirmationResultDto'];
+type PmsReservationPayment =
+  components['schemas']['ReservationPaymentStateDto'];
+
+/** `PaymentStatus` du PMS (Pending=1, Processing=2, Succeeded=3, Failed=4, Cancelled=5, Refunded=6…). */
+const PAYMENT_STATUS_SUCCEEDED = 3;
+const PAYMENT_STATUS_REFUNDED = 6;
 
 /**
  * Statuts déjà au-delà de la confirmation : la preuve se construit depuis la relecture, sans
@@ -138,7 +145,11 @@ export class PaymentService {
       });
     }
     if (reservation.status === 'Cancelled') {
-      throw toConfirmException('reservation-cancelled');
+      // #4 AC-8 : le statut de débit est énoncé d'après le paiement lu au PMS, jamais supposé.
+      throw toConfirmException(
+        'reservation-cancelled',
+        await this.debitStatusOf(reservationId),
+      );
     }
     if (reservation.status !== 'Pending') {
       // NoShow ou statut inconnu : ne jamais tenter de confirmer un état qu'on ne comprend pas.
@@ -258,6 +269,16 @@ export class PaymentService {
       data = (await this.pms.post<PmsConfirmation>(path, undefined, ctx)).data;
     } catch (err) {
       const reason = classifyConfirmFailure(err);
+      if (reason === 'room-unavailable' || reason === 'reservation-cancelled') {
+        // #4 AC-7 / AC-8 : la réservation est morte côté PMS (paiement libéré ou remboursé). Le
+        // statut de débit vient du PMS ; le hold part avec sa clé d'idempotence (réservation morte).
+        this.logger.warn(
+          `Confirmation refusée pour la réservation ${reservationId} : « ${reason} ».`,
+        );
+        const debit = await this.debitStatusOf(reservationId);
+        await this.releaseDeadHold(reservationId);
+        throw toConfirmException(reason, debit);
+      }
       if (reason !== null) {
         this.logger.warn(
           `Confirmation refusée pour la réservation ${reservationId} : « ${reason} ».`,
@@ -283,6 +304,54 @@ export class PaymentService {
       throw new ServiceUnavailableException(BROKEN_CONTRACT_MESSAGE);
     }
     return data;
+  }
+
+  /**
+   * Statut de débit d'une réservation qui ne sera pas confirmée (#4, AC-8), d'après le dernier
+   * paiement lu par la route de service `GET /reservations/{id}/payment` (#153) : remboursé
+   * (`Refunded`), encaissé sans remboursement (`Succeeded`), sinon aucun débit conservé.
+   *
+   * Lecture en échec : `undefined`, jamais un statut deviné. Best-effort : elle ne masque jamais le
+   * refus d'origine, qui est ce que le voyageur doit voir.
+   */
+  private async debitStatusOf(
+    reservationId: string,
+  ): Promise<ConfirmDebitStatus | undefined> {
+    try {
+      const path = PMS_CONFIRMATION_ENDPOINTS.payment(reservationId);
+      const res = await this.pms.get<PmsReservationPayment>(
+        path,
+        this.serviceKey.serviceContext('GET', path, this.pmsContext()),
+      );
+      if (!res.data) {
+        return undefined;
+      }
+      const status = res.data.payment?.status;
+      if (status === PAYMENT_STATUS_REFUNDED) {
+        return 'refunded';
+      }
+      return status === PAYMENT_STATUS_SUCCEEDED ? 'captured' : 'none';
+    } catch {
+      this.logger.warn(
+        `Statut de débit de la réservation ${reservationId} illisible : non énoncé.`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Libère le hold d'une réservation que le PMS a annulée (#4, AC-7) : enregistrement, index **et**
+   * clé d'idempotence, la réservation étant morte. Best-effort : le balayeur ferait de même en
+   * relisant `Cancelled`.
+   */
+  private async releaseDeadHold(reservationId: string): Promise<void> {
+    try {
+      await this.holds.release(reservationId);
+    } catch {
+      this.logger.warn(
+        `Hold de la réservation ${reservationId} non libéré (le balayeur relira l'annulation).`,
+      );
+    }
   }
 
   /**
@@ -593,7 +662,16 @@ export class PaymentService {
     }
 
     try {
-      await this.holds.clearPaymentStarted(reservationId);
+      const outcome = await this.holds.clearPaymentStarted(reservationId);
+      if (outcome === 'kept') {
+        // #4 (constat de la livraison de #3) : un intent émis plus tôt a créé une ligne `Payment`,
+        // carte peut-être retenue. Le gel reste ; le balayeur tranchera sur l'état lu au PMS.
+        this.logger.warn(
+          `Gel du hold conservé pour la réservation ${reservationId} : refus « ${reason} », ` +
+            `mais un intent a déjà été émis.`,
+        );
+        return;
+      }
       this.logger.warn(
         `Gel du hold relâché pour la réservation ${reservationId} : refus « ${reason} », ` +
           `aucun paiement ne peut exister.`,

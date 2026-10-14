@@ -4751,6 +4751,15 @@ export interface paths {
                         "application/json": components["schemas"]["ApiResponse"];
                     };
                 };
+                /** @description Conflict */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
                 /** @description Bad Gateway */
                 502: {
                     headers: {
@@ -5347,7 +5356,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel a reservation (Customer can only cancel their own pending/confirmed reservations). */
+        /**
+         * Cancel a reservation (Customer can only cancel their own pending/confirmed reservations).
+         * @description #4 (story 3.3): the Stripe payment is released BEFORE the transition — a live intent is cancelled,
+         *     money collected on a Pending reservation is refunded in full. When Stripe cannot do it, nothing is
+         *     cancelled and the answer is a 502 (`The payment of this reservation could not be released`),
+         *     safe to replay. A Confirmed reservation whose payment is captured is refused with a 400.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -5398,6 +5413,15 @@ export interface paths {
                 };
                 /** @description Not Found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Bad Gateway */
+                502: {
                     headers: {
                         [name: string]: unknown;
                     };
