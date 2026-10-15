@@ -22,6 +22,7 @@ import { PaymentReconciler } from '../src/modules/payment/payment-reconciler';
 import {
   PaymentReconcileStore,
   RECONCILE_DUE_KEY,
+  RECONCILE_IDLE_DUE_KEY,
   RECONCILE_INDEX_KEY,
   RECONCILE_KEY_PREFIX,
   RECONCILE_LOCK_KEY,
@@ -480,10 +481,18 @@ describe('payment/reconcile (e2e — Redis réel + PMS mocké)', () => {
 
         expect(confirm.isDone()).toBe(false);
         expect(await isCandidate()).toBe(true);
-        const due = Number(
+        // #185 : rangé parmi les paiements abandonnés, une seule échéance, dans le futur.
+        expect(
           await redis.raw.zscore(RECONCILE_DUE_KEY, reservationId),
+        ).toBeNull();
+        const due = Number(
+          await redis.raw.zscore(RECONCILE_IDLE_DUE_KEY, reservationId),
         );
         expect(due).toBeGreaterThan(Date.now());
+        expect(await readRecord()).toMatchObject({
+          idleRounds: 1,
+          failures: 0,
+        });
       },
     );
 
@@ -657,6 +666,145 @@ describe('payment/reconcile (e2e — Redis réel + PMS mocké)', () => {
       expect(alerts()).toEqual([
         expect.objectContaining({ kind: 'captured-not-confirmable' }),
       ]);
+    });
+  });
+
+  describe('paiements abandonnés (#185)', () => {
+    it('AC-1 : relectures successives sans argent engagé, échéance de plus en plus espacée', async () => {
+      intentStatus = null;
+      mockServiceReads();
+      const confirm = mockConfirm();
+      await seedCandidate();
+
+      const delays: number[] = [];
+      for (let pass = 0; pass < 3; pass++) {
+        const before = Date.now();
+        await reconciler.reconcile();
+        const due = Number(
+          await redis.raw.zscore(RECONCILE_IDLE_DUE_KEY, reservationId),
+        );
+        delays.push(due - before);
+        // Remis en tête de l'échéancier prioritaire pour la passe suivante (lot de 1).
+        await makeDue();
+      }
+
+      expect(confirm.isDone()).toBe(false);
+      expect((await readRecord())?.idleRounds).toBe(3);
+      // Intervalle de la suite : 10 s → ~10 s, ~20 s, ~40 s (marge pour la durée de la passe).
+      expect(delays[0]).toBeGreaterThanOrEqual(10_000);
+      expect(delays[0]).toBeLessThan(20_000);
+      expect(delays[1]).toBeGreaterThanOrEqual(20_000);
+      expect(delays[1]).toBeLessThan(40_000);
+      expect(delays[2]).toBeGreaterThanOrEqual(40_000);
+    });
+
+    it('AC-2 : abandonné puis autorisé : confirmation rejouée, candidat sorti des deux échéanciers', async () => {
+      intentStatus = null;
+      mockServiceReads();
+      const confirm = mockConfirm();
+      await seedCandidate();
+      await reconciler.reconcile();
+      expect((await readRecord())?.idleRounds).toBe(1);
+
+      intentStatus = 'requires_capture';
+      await makeDue();
+      await reconciler.reconcile();
+
+      expect(confirm.isDone()).toBe(true);
+      expect(await isCandidate()).toBe(false);
+      expect(
+        await redis.raw.zscore(RECONCILE_DUE_KEY, reservationId),
+      ).toBeNull();
+      expect(
+        await redis.raw.zscore(RECONCILE_IDLE_DUE_KEY, reservationId),
+      ).toBeNull();
+    });
+
+    it('AC-3 : un abandon échu plus ancien ne prend pas la place d’un paiement engagé (lot de 1)', async () => {
+      const abandoned = randomUUID();
+      try {
+        await store.enroll(abandoned, Date.now() - 300_000);
+        const current = JSON.parse(
+          (await redis.get(RECONCILE_KEY_PREFIX + abandoned))!,
+        ) as ReconcileRecord;
+        // Abandon déjà lu, dû depuis bien plus longtemps que le candidat du test.
+        await store.update(
+          { ...current, idleRounds: 2 },
+          -Date.now() - 1_000_000,
+        );
+        expect(await redis.raw.zscore(RECONCILE_DUE_KEY, abandoned)).toBeNull();
+
+        mockServiceReads();
+        const confirm = mockConfirm();
+        await seedCandidate();
+
+        await reconciler.reconcile();
+
+        expect(confirm.isDone()).toBe(true);
+        expect(seen.some((c) => c.path.includes(abandoned))).toBe(false);
+        // L'abandon n'a pas été lu : toujours dû, toujours parmi les abandons.
+        expect(
+          Number(await redis.raw.zscore(RECONCILE_IDLE_DUE_KEY, abandoned)),
+        ).toBeLessThan(0);
+      } finally {
+        await store.remove(abandoned);
+      }
+    });
+
+    it('une réémission d’intent replace un abandon dans l’échéancier prioritaire', async () => {
+      await store.enroll(reservationId, 1_000_000);
+      const current = (await readRecord())!;
+      await store.update({ ...current, idleRounds: 4 }, 5_000_000);
+      expect(
+        await redis.raw.zscore(RECONCILE_DUE_KEY, reservationId),
+      ).toBeNull();
+
+      await store.enroll(reservationId, 2_000_000);
+
+      expect(
+        await redis.raw.zscore(RECONCILE_IDLE_DUE_KEY, reservationId),
+      ).toBeNull();
+      expect(
+        Number(await redis.raw.zscore(RECONCILE_DUE_KEY, reservationId)),
+      ).toBe(2_000_000 + 10_000);
+      // Première émission conservée.
+      expect(
+        Number(await redis.raw.zscore(RECONCILE_INDEX_KEY, reservationId)),
+      ).toBe(1_000_000);
+    });
+
+    it('le retrait vide aussi l’échéancier des abandons', async () => {
+      await store.enroll(reservationId, Date.now());
+      const current = (await readRecord())!;
+      await store.update({ ...current, idleRounds: 1 }, 5_000_000);
+      await store.remove(reservationId);
+      expect(
+        await redis.raw.zscore(RECONCILE_IDLE_DUE_KEY, reservationId),
+      ).toBeNull();
+      expect(await isCandidate()).toBe(false);
+    });
+
+    it('AC-1 : un abandon échu est servi depuis l’échéancier des abandons, pas avant (Redis réel)', async () => {
+      const later = randomUUID();
+      try {
+        await store.enroll(reservationId, Date.now() - 300_000);
+        const current = (await readRecord())!;
+        await store.update({ ...current, idleRounds: 2 }, -Date.now());
+        await store.enroll(later, Date.now() - 300_000);
+        const other = JSON.parse(
+          (await redis.get(RECONCILE_KEY_PREFIX + later))!,
+        ) as ReconcileRecord;
+        await store.update({ ...other, idleRounds: 3 }, Date.now() + 600_000);
+
+        // Lot large : la place restante après les prioritaires revient aux abandons échus.
+        const due = await store.due(Date.now(), 500);
+
+        expect(due).toContain(reservationId);
+        expect(due).not.toContain(later);
+        expect(new Set(due).size).toBe(due.length);
+      } finally {
+        await store.remove(later);
+      }
     });
   });
 

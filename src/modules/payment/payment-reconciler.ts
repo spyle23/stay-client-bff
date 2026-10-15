@@ -76,6 +76,14 @@ const PASS_LOCK_TTL_CAP_MS = 300_000;
 const BACKOFF_MAX_FACTOR = 16;
 const BACKOFF_CAP_MS = 3_600_000;
 
+/**
+ * Plafond de l'espacement des relectures d'un paiement abandonné (#185 AC-1) : 15 min, jamais moins
+ * d'un intervalle. Un voyageur qui finit par payer après une longue pause, et dont la confirmation
+ * navigateur se perd, est rattrapé au plus 15 min plus tard ; une réémission d'intent le fait relire
+ * dès la fin du délai de grâce (`ENROLL_SCRIPT`).
+ */
+const IDLE_BACKOFF_CAP_MS = 900_000;
+
 /** Contexte d'un candidat pendant une passe. */
 interface Candidate {
   record: ReconcileRecord;
@@ -101,6 +109,9 @@ interface Candidate {
  *    annulation sans argent engagé ou l'âge maximal font sortir un candidat (AC-1, AC-5).
  * 4. **Aucune boucle aveugle** : backoff borné sur les pannes, aucun rejeu après un refus
  *    déterministe, alerte `integrity.alert` dès qu'un humain doit intervenir (AC-5, AC-6).
+ * 5. **Les paiements abandonnés ne passent jamais devant l'argent engagé** (#185) : un `Pending`
+ *    sans argent engagé est relu de plus en plus rarement (plafond 15 min), sans compter d'échec,
+ *    et rangé dans un échéancier servi après les candidats prioritaires.
  *
  * Patron du balayeur (`checkout-hold.sweeper.ts`) : verrou de passe, échéance de passe, isolement de
  * chaque élément, `X-Correlation-ID` de passe propagé au PMS.
@@ -315,6 +326,10 @@ export class PaymentReconciler implements OnModuleInit, OnModuleDestroy {
       payment !== null &&
       typeof payment.intentStatus === 'string' &&
       MONEY_ENGAGED.has(payment.intentStatus);
+    if (engaged) {
+      // #185 AC-2 : de l'argent engagé sort le candidat des abandons (intervalle normal, priorité).
+      record.idleRounds = 0;
+    }
 
     if (status === STATUS_CANCELLED) {
       if (!engaged) {
@@ -337,8 +352,9 @@ export class PaymentReconciler implements OnModuleInit, OnModuleDestroy {
     }
 
     if (!engaged) {
-      // Pending, aucun argent engagé (paiement pas encore autorisé) : rien à faire, on repasse.
-      await this.waitAgain(candidate);
+      // Pending, aucun argent engagé (paiement pas encore autorisé, ou abandonné) : rien à faire,
+      // on repasse de plus en plus rarement (#185).
+      await this.waitIdle(candidate);
       return;
     }
 
@@ -444,6 +460,22 @@ export class PaymentReconciler implements OnModuleInit, OnModuleDestroy {
       candidate.record,
       candidate.now + this.options.intervalMs,
     );
+  }
+
+  /**
+   * `Pending` sans argent engagé (#185 AC-1) : relu après intervalle × 2^k (k = lectures sans
+   * argent engagé précédentes), plafonné à 15 min, rangé parmi les abandons. Ni un échec (compteur
+   * de pannes remis à 0), ni une alerte : c'est l'état normal d'un voyageur qui n'a pas (encore) payé.
+   */
+  private async waitIdle(candidate: Candidate): Promise<void> {
+    const { record } = candidate;
+    record.failures = 0;
+    record.idleRounds = (record.idleRounds ?? 0) + 1;
+    const interval = this.options.intervalMs;
+    const cap = Math.max(interval, IDLE_BACKOFF_CAP_MS);
+    const exponent = Math.min(record.idleRounds - 1, 30);
+    const delayMs = Math.min(interval * Math.pow(2, exponent), cap);
+    await this.store.update(record, candidate.now + delayMs);
   }
 
   /** Échec transitoire : backoff exponentiel borné, jamais de retrait (AC-5). */
@@ -591,6 +623,7 @@ function freshRecord(reservationId: string, issuedAt: number): ReconcileRecord {
     lastIntentStatus: null,
     refusal: null,
     lastAlertAt: null,
+    idleRounds: 0,
   };
 }
 
