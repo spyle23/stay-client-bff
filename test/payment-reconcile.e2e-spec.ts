@@ -783,6 +783,29 @@ describe('payment/reconcile (e2e — Redis réel + PMS mocké)', () => {
       ).toBeNull();
       expect(await isCandidate()).toBe(false);
     });
+
+    it('AC-1 : un abandon échu est servi depuis l’échéancier des abandons, pas avant (Redis réel)', async () => {
+      const later = randomUUID();
+      try {
+        await store.enroll(reservationId, Date.now() - 300_000);
+        const current = (await readRecord())!;
+        await store.update({ ...current, idleRounds: 2 }, -Date.now());
+        await store.enroll(later, Date.now() - 300_000);
+        const other = JSON.parse(
+          (await redis.get(RECONCILE_KEY_PREFIX + later))!,
+        ) as ReconcileRecord;
+        await store.update({ ...other, idleRounds: 3 }, Date.now() + 600_000);
+
+        // Lot large : la place restante après les prioritaires revient aux abandons échus.
+        const due = await store.due(Date.now(), 500);
+
+        expect(due).toContain(reservationId);
+        expect(due).not.toContain(later);
+        expect(new Set(due).size).toBe(due.length);
+      } finally {
+        await store.remove(later);
+      }
+    });
   });
 
   describe('scripts Lua réels de l’index (AC-1)', () => {
