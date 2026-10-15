@@ -43,6 +43,7 @@ function record(overrides: Partial<ReconcileRecord> = {}): ReconcileRecord {
     lastIntentStatus: null,
     refusal: null,
     lastAlertAt: null,
+    idleRounds: 0,
     ...overrides,
   };
 }
@@ -305,10 +306,11 @@ describe('PaymentReconciler (#5)', () => {
         expect(deps.pms.post).not.toHaveBeenCalled();
         expect(deps.lock.acquire).not.toHaveBeenCalled();
         expect(deps.store.remove).not.toHaveBeenCalled();
-        // Toujours candidat : la passe suivante relira, au rythme de l'intervalle.
+        // Toujours candidat : 1ʳᵉ lecture sans argent engagé, relu après un intervalle (#185 AC-1).
         const { rec, nextAt } = lastUpdate(deps);
         expect(nextAt).toBe(NOW + options.intervalMs);
         expect(rec.failures).toBe(0);
+        expect(rec.idleRounds).toBe(1);
         expect(rec.lastIntentStatus).toBe(intentStatus);
       },
     );
@@ -341,6 +343,283 @@ describe('PaymentReconciler (#5)', () => {
       expect(deps.pms.post).not.toHaveBeenCalled();
       expect(deps.store.remove).not.toHaveBeenCalled();
       expect(lastUpdate(deps).rec.failures).toBe(1);
+    });
+  });
+
+  describe('paiements abandonnés (#185)', () => {
+    it('AC-1 : l’échéance d’un Pending sans argent engagé s’espace (intervalle × 2^k, plafond 15 min)', async () => {
+      const delays: number[] = [];
+      const rounds: (number | undefined)[] = [];
+      for (const idleRounds of [0, 1, 2, 3, 4, 5, 12, 40]) {
+        const deps = makeDeps();
+        deps.setPayment(idleRounds % 2 === 0 ? noPayment : payment('canceled'));
+        deps.entries.set(ID, {
+          record: record({ idleRounds }),
+          issuedAt: NOW - 120_000,
+        });
+        await build(deps).reconcile();
+        const { rec, nextAt } = lastUpdate(deps);
+        delays.push(nextAt - NOW);
+        rounds.push(rec.idleRounds);
+        expect(deps.pms.post).not.toHaveBeenCalled();
+        expect(deps.store.remove).not.toHaveBeenCalled();
+      }
+      expect(delays).toEqual([
+        60_000, 120_000, 240_000, 480_000, 900_000, 900_000, 900_000, 900_000,
+      ]);
+      expect(rounds).toEqual([1, 2, 3, 4, 5, 6, 13, 41]);
+    });
+
+    it('AC-1 : plafond de 15 min jamais sous un intervalle', async () => {
+      const deps = makeDeps();
+      deps.setPayment(noPayment);
+      deps.entries.set(ID, {
+        record: record({ idleRounds: 9 }),
+        issuedAt: NOW - 120_000,
+      });
+      await build(deps, { intervalMs: 600_000 }).reconcile();
+      expect(lastUpdate(deps).nextAt - NOW).toBe(900_000);
+    });
+
+    it('AC-1 : une lecture sans argent engagé ne compte pas comme un échec, ni n’alerte', async () => {
+      const deps = makeDeps();
+      deps.setPayment(payment('requires_payment_method'));
+      deps.entries.set(ID, {
+        // Échecs transitoires antérieurs (PMS en panne) : la lecture réussie les remet à zéro.
+        record: record({ failures: 3, idleRounds: 2, issuedAt: NOW - 950_000 }),
+        issuedAt: NOW - 950_000,
+      });
+      await build(deps).reconcile();
+      const { rec } = lastUpdate(deps);
+      expect(rec.failures).toBe(0);
+      expect(rec.idleRounds).toBe(3);
+      expect(alerts()).toHaveLength(0);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it('AC-1 : un état antérieur à #185 (sans idleRounds) démarre la progression à zéro', async () => {
+      const deps = makeDeps();
+      deps.setPayment(noPayment);
+      const legacy = record();
+      delete legacy.idleRounds;
+      deps.entries.set(ID, {
+        record: legacy,
+        issuedAt: NOW - 120_000,
+      });
+      await build(deps).reconcile();
+      const { rec, nextAt } = lastUpdate(deps);
+      expect(rec.idleRounds).toBe(1);
+      expect(nextAt).toBe(NOW + options.intervalMs);
+    });
+
+    it.each(['requires_capture', 'succeeded'])(
+      'AC-2 : abandonné puis %s : confirmation rejouée comme aujourd’hui',
+      async (intentStatus) => {
+        const deps = makeDeps();
+        deps.setPayment(payment(intentStatus));
+        deps.entries.set(ID, {
+          record: record({ idleRounds: 4, lastIntentStatus: null }),
+          issuedAt: NOW - 120_000,
+        });
+        await build(deps).reconcile();
+        expect(deps.pms.post).toHaveBeenCalledTimes(1);
+        expect(deps.store.remove).toHaveBeenCalledWith(ID);
+      },
+    );
+
+    it('AC-2 : abandonné puis argent engagé, confirmation déjà en vol : retour à l’intervalle normal', async () => {
+      const deps = makeDeps();
+      deps.lock.acquire.mockResolvedValueOnce(null);
+      deps.entries.set(ID, {
+        record: record({ idleRounds: 4 }),
+        issuedAt: NOW - 120_000,
+      });
+      await build(deps).reconcile();
+      const { rec, nextAt } = lastUpdate(deps);
+      expect(rec.idleRounds).toBe(0);
+      expect(nextAt).toBe(NOW + options.intervalMs);
+    });
+
+    it('AC-2 : abandonné puis argent engagé, panne à la confirmation : backoff des pannes, plus des abandons', async () => {
+      const deps = makeDeps();
+      deps.pms.post.mockRejectedValueOnce(new PmsUnavailableError('down'));
+      deps.entries.set(ID, {
+        record: record({ idleRounds: 4 }),
+        issuedAt: NOW - 120_000,
+      });
+      await build(deps).reconcile();
+      const { rec, nextAt } = lastUpdate(deps);
+      expect(rec.idleRounds).toBe(0);
+      expect(rec.failures).toBe(1);
+      expect(nextAt).toBe(NOW + options.intervalMs);
+    });
+
+    it('lecture en échec d’un abandonné : backoff des pannes, toujours classé abandonné', async () => {
+      const deps = makeDeps();
+      deps.pms.get.mockRejectedValueOnce(new PmsUnavailableError('down'));
+      deps.entries.set(ID, {
+        record: record({ idleRounds: 3, failures: 1 }),
+        issuedAt: NOW - 120_000,
+      });
+      await build(deps).reconcile();
+      const { rec, nextAt } = lastUpdate(deps);
+      expect(rec.idleRounds).toBe(3);
+      expect(rec.failures).toBe(2);
+      expect(nextAt).toBe(NOW + 2 * options.intervalMs);
+    });
+
+    /**
+     * AC-3 : passes enchaînées sur un échéancier à deux niveaux, fidèle au contrat de
+     * `PaymentReconcileStore.due` / `update` (prioritaires d'abord, abandons ensuite, rangement
+     * selon `idleRounds`). Le contrat Redis réel est prouvé par l'e2e et la spec du magasin.
+     */
+    describe('AC-3 : N > lot abandonnés et un candidat engagé', () => {
+      const BATCH = 5;
+      const ABANDONED = 12;
+      const guid = (n: number) =>
+        `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+      const ENGAGED = guid(999);
+
+      function tieredDeps() {
+        const deps = makeDeps();
+        const records = new Map<string, ReconcileRecord>();
+        const dueAt = new Map<string, number>();
+        const confirmed = new Set<string>();
+        const reads = new Map<string, number>();
+        let clock = NOW;
+        jest.spyOn(Date, 'now').mockImplementation(() => clock);
+
+        const tierOf = (id: string) =>
+          (records.get(id)?.idleRounds ?? 0) > 0 ? 'idle' : 'priority';
+        const dueIn = (tier: string, now: number) =>
+          [...dueAt.entries()]
+            .filter(([id, at]) => tierOf(id) === tier && at <= now)
+            .sort((a, b) => a[1] - b[1])
+            .map(([id]) => id);
+
+        deps.store.due.mockImplementation((now: number, limit: number) => {
+          const priority = dueIn('priority', now).slice(0, limit);
+          const idle = dueIn('idle', now).slice(0, limit - priority.length);
+          return Promise.resolve([...priority, ...idle]);
+        });
+        deps.store.read.mockImplementation((id: string) => {
+          const rec = records.get(id);
+          return Promise.resolve(
+            rec
+              ? { record: { ...rec }, issuedAt: rec.issuedAt }
+              : { record: null, issuedAt: null },
+          );
+        });
+        deps.store.update.mockImplementation(
+          (rec: ReconcileRecord, nextAt: number) => {
+            records.set(rec.reservationId, { ...rec });
+            dueAt.set(rec.reservationId, nextAt);
+            return Promise.resolve(true);
+          },
+        );
+        deps.store.remove.mockImplementation((id: string) => {
+          records.delete(id);
+          dueAt.delete(id);
+          return Promise.resolve(undefined);
+        });
+
+        const idOf = (path: string) => path.split('/')[2];
+        deps.pms.get.mockImplementation((path: string) => {
+          const id = idOf(path);
+          if (path.endsWith('/payment')) {
+            reads.set(id, (reads.get(id) ?? 0) + 1);
+            return Promise.resolve(
+              id === ENGAGED
+                ? payment('requires_capture')
+                : { success: true, data: { reservationId: id, payment: null } },
+            );
+          }
+          return Promise.resolve(state(confirmed.has(id) ? 2 : 1));
+        });
+        deps.pms.post.mockImplementation((...args: unknown[]) => {
+          const path = String(args[0]);
+          confirmed.add(idOf(path));
+          return Promise.resolve({
+            success: true,
+            data: { reservationId: idOf(path), alreadyConfirmed: false },
+          });
+        });
+
+        const seed = (id: string, issuedAt: number, rec = {}) => {
+          records.set(id, record({ reservationId: id, issuedAt, ...rec }));
+          dueAt.set(id, issuedAt + options.intervalMs);
+        };
+        return {
+          deps,
+          seed,
+          confirmed,
+          reads,
+          dueAt,
+          tick: (ms: number) => {
+            clock += ms;
+          },
+        };
+      }
+
+      it('abandons connus en tête d’échéance : le candidat engagé est confirmé dès la passe où il est dû', async () => {
+        const sim = tieredDeps();
+        for (let n = 0; n < ABANDONED; n++) {
+          // Abandons plus anciens que le candidat engagé, déjà lus au moins une fois.
+          sim.seed(guid(n), NOW - 3_600_000 - n, {
+            idleRounds: 1,
+            lastIntentStatus: 'requires_payment_method',
+          });
+        }
+        sim.seed(ENGAGED, NOW - options.intervalMs);
+        await build(sim.deps, { batchSize: BATCH }).reconcile();
+        expect(sim.confirmed.has(ENGAGED)).toBe(true);
+      });
+
+      it('passes enchaînées : une fois les abandons relus, le candidat engagé n’attend pas plus d’une passe', async () => {
+        const sim = tieredDeps();
+        const reconciler = build(sim.deps, { batchSize: BATCH });
+        for (let n = 0; n < ABANDONED; n++) {
+          sim.seed(guid(n), NOW - 600_000 - n);
+        }
+        // Les abandons, plus anciens, remplissent les premières passes, puis sont relus en backoff.
+        for (let pass = 0; pass < 4; pass++) {
+          await reconciler.reconcile();
+          sim.tick(options.intervalMs);
+        }
+        expect(sim.reads.size).toBe(ABANDONED);
+        for (let pass = 0; pass < 6; pass++) {
+          // Un paiement autorisé, dû à cette passe, dont la confirmation navigateur est perdue.
+          const id = guid(500 + pass);
+          sim.seed(id, Date.now() - options.intervalMs);
+          sim.reads.set(id, 0);
+          await reconciler.reconcile();
+          sim.tick(options.intervalMs);
+          // Lu dans la passe où il est dû, malgré les abandons échus plus anciens.
+          expect(sim.reads.get(id)).toBe(1);
+        }
+        sim.seed(ENGAGED, Date.now() - options.intervalMs);
+        await reconciler.reconcile();
+        expect(sim.confirmed.has(ENGAGED)).toBe(true);
+      });
+
+      it('les abandons sont relus de moins en moins souvent (charge PMS et Stripe bornée)', async () => {
+        const sim = tieredDeps();
+        const reconciler = build(sim.deps, { batchSize: BATCH });
+        for (let n = 0; n < ABANDONED; n++) {
+          sim.seed(guid(n), NOW - 600_000 - n);
+        }
+        for (let pass = 0; pass < 30; pass++) {
+          await reconciler.reconcile();
+          sim.tick(options.intervalMs);
+        }
+        const total = [...sim.reads.values()].reduce((a, b) => a + b, 0);
+        // Sans backoff : lot plein à chaque passe (30 × 5 = 150 lectures).
+        expect(total).toBeLessThan(30 * BATCH);
+        for (const count of sim.reads.values()) {
+          // 30 min de passes : au plus 1+1+2+4+8 min puis une lecture par quart d'heure.
+          expect(count).toBeLessThanOrEqual(8);
+        }
+      });
     });
   });
 

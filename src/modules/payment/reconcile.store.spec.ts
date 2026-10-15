@@ -5,6 +5,7 @@ import {
   ENROLL_SCRIPT,
   PaymentReconcileStore,
   RECONCILE_DUE_KEY,
+  RECONCILE_IDLE_DUE_KEY,
   RECONCILE_INDEX_KEY,
   RECONCILE_KEY_PREFIX,
   RECONCILE_LOCK_KEY,
@@ -49,6 +50,7 @@ function record(overrides: Partial<ReconcileRecord> = {}): ReconcileRecord {
     lastIntentStatus: null,
     refusal: null,
     lastAlertAt: null,
+    idleRounds: 0,
     ...overrides,
   };
 }
@@ -70,10 +72,11 @@ describe('PaymentReconcileStore (#5 AC-1)', () => {
 
     expect(redis.raw.eval).toHaveBeenCalledWith(
       ENROLL_SCRIPT,
-      3,
+      4,
       RECONCILE_KEY_PREFIX + ID,
       RECONCILE_INDEX_KEY,
       RECONCILE_DUE_KEY,
+      RECONCILE_IDLE_DUE_KEY,
       expect.any(String),
       691_200 + 86_400,
       1_000,
@@ -81,7 +84,7 @@ describe('PaymentReconcileStore (#5 AC-1)', () => {
       ID,
     );
     const written = JSON.parse(
-      (redis.raw.eval.mock.calls[0] as unknown[])[5] as string,
+      (redis.raw.eval.mock.calls[0] as unknown[])[6] as string,
     ) as ReconcileRecord;
     expect(written).toEqual(record());
   });
@@ -89,12 +92,13 @@ describe('PaymentReconcileStore (#5 AC-1)', () => {
   it('l’état inscrit ne porte ni donnée personnelle ni jeton (clés exactes)', async () => {
     await store.enroll(ID, 1_000);
     const written = JSON.parse(
-      (redis.raw.eval.mock.calls[0] as unknown[])[5] as string,
+      (redis.raw.eval.mock.calls[0] as unknown[])[6] as string,
     ) as Record<string, unknown>;
     expect(Object.keys(written).sort()).toEqual(
       [
         'attempts',
         'failures',
+        'idleRounds',
         'issuedAt',
         'lastAlertAt',
         'lastIntentStatus',
@@ -108,6 +112,11 @@ describe('PaymentReconcileStore (#5 AC-1)', () => {
   it('le script d’inscription ne réécrit jamais un candidat existant (première émission conservée)', () => {
     expect(ENROLL_SCRIPT).toMatch(/exists/);
     expect(ENROLL_SCRIPT).toMatch(/'NX'/);
+  });
+
+  it('#185 : une réémission sort un candidat abandonné de l’échéancier des abandons', () => {
+    // Le voyageur revient payer : sa prochaine lecture repasse devant les paiements abandonnés.
+    expect(ENROLL_SCRIPT).toMatch(/'zrem', KEYS\[4\]/);
   });
 
   it('une panne Redis à l’inscription devient un 503, jamais un 500', async () => {
@@ -141,28 +150,88 @@ describe('PaymentReconcileStore (#5 AC-1)', () => {
     );
     expect(redis.raw.eval).toHaveBeenCalledWith(
       UPDATE_SCRIPT,
-      3,
+      4,
       RECONCILE_KEY_PREFIX + ID,
       RECONCILE_INDEX_KEY,
       RECONCILE_DUE_KEY,
+      RECONCILE_IDLE_DUE_KEY,
       JSON.stringify(record({ failures: 2 })),
       691_200 + 86_400,
       5_000,
       ID,
+      '0',
     );
     expect(UPDATE_SCRIPT).toMatch(/zscore/);
   });
 
-  it('retire état, index et échéance en un seul pas', async () => {
+  it('#185 AC-3 : un candidat abandonné (idleRounds > 0) est replanifié dans l’échéancier des abandons', async () => {
+    await store.update(record({ idleRounds: 2 }), 5_000);
+    const call = redis.raw.eval.mock.calls[0] as unknown[];
+    expect(call[0]).toBe(UPDATE_SCRIPT);
+    expect(call[call.length - 1]).toBe('1');
+    // Le script retire le membre de l'autre échéancier : jamais deux échéances pour un candidat.
+    expect(UPDATE_SCRIPT).toMatch(/'zrem', KEYS\[3\]/);
+    expect(UPDATE_SCRIPT).toMatch(/'zrem', KEYS\[4\]/);
+  });
+
+  it('#185 : un état antérieur sans idleRounds reste prioritaire', async () => {
+    const legacy = record();
+    delete legacy.idleRounds;
+    await store.update(legacy, 5_000);
+    const call = redis.raw.eval.mock.calls[0] as unknown[];
+    expect(call[call.length - 1]).toBe('0');
+  });
+
+  it('retire état, index et échéances en un seul pas', async () => {
     await store.remove(ID);
     expect(redis.raw.eval).toHaveBeenCalledWith(
       REMOVE_SCRIPT,
-      3,
+      4,
       RECONCILE_KEY_PREFIX + ID,
       RECONCILE_INDEX_KEY,
       RECONCILE_DUE_KEY,
+      RECONCILE_IDLE_DUE_KEY,
       ID,
     );
+  });
+
+  it('#185 AC-3 : sert d’abord l’échéancier prioritaire, complète avec les abandons', async () => {
+    const OTHER = '7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d';
+    redis.raw.zrangebyscore
+      .mockResolvedValueOnce([ID])
+      .mockResolvedValueOnce([OTHER]);
+    await expect(store.due(9_000, 3)).resolves.toEqual([ID, OTHER]);
+    expect(redis.raw.zrangebyscore).toHaveBeenNthCalledWith(
+      1,
+      RECONCILE_DUE_KEY,
+      '-inf',
+      9_000,
+      'LIMIT',
+      0,
+      3,
+    );
+    expect(redis.raw.zrangebyscore).toHaveBeenNthCalledWith(
+      2,
+      RECONCILE_IDLE_DUE_KEY,
+      '-inf',
+      9_000,
+      'LIMIT',
+      0,
+      2,
+    );
+  });
+
+  it('#185 AC-3 : lot rempli par les prioritaires, les abandons ne sont pas lus', async () => {
+    redis.raw.zrangebyscore.mockResolvedValueOnce([ID, 'b', 'c']);
+    await expect(store.due(9_000, 3)).resolves.toEqual([ID, 'b', 'c']);
+    expect(redis.raw.zrangebyscore).toHaveBeenCalledTimes(1);
+  });
+
+  it('#185 : un membre lu dans les deux échéanciers (déplacé entre les lectures) n’est servi qu’une fois', async () => {
+    redis.raw.zrangebyscore
+      .mockResolvedValueOnce([ID])
+      .mockResolvedValueOnce([ID]);
+    await expect(store.due(9_000, 3)).resolves.toEqual([ID]);
   });
 
   it('lit les échéances et les candidats trop anciens (borne exclusive), bornés au lot', async () => {
