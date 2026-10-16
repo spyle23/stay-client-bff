@@ -699,13 +699,18 @@ describe('CheckoutHoldSweeper', () => {
       deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
       routePms(deps, { payment: payment({ intentStatus: 'requires_action' }) });
       deps.post.mockRejectedValue(abandonRefused());
-      deps.dueHolds
-        .mockResolvedValueOnce([RESERVATION_ID])
-        .mockResolvedValue([]);
+      // L'index ne rend le hold que tant qu'il n'a pas été oublié : un report (au lieu de l'oubli)
+      // le laisserait dû, et la passe suivante redemanderait l'annulation.
+      deps.dueHolds.mockImplementation(() =>
+        Promise.resolve(
+          deps.forget.mock.calls.length === 0 ? [RESERVATION_ID] : [],
+        ),
+      );
 
       await sweeper.sweep();
       await sweeper.sweep();
 
+      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
       expect(deps.post).toHaveBeenCalledTimes(1);
     });
 
