@@ -1,7 +1,10 @@
 import { Logger, UnauthorizedException } from '@nestjs/common';
 import type { SchedulerRegistry } from '@nestjs/schedule';
 import type { PmsClientService } from '../../integration/pms/pms-client.service';
-import { PmsUnavailableError } from '../../integration/pms/pms-errors';
+import {
+  PmsRequestError,
+  PmsUnavailableError,
+} from '../../integration/pms/pms-errors';
 import type { ServiceKeyProvider } from '../../integration/pms/service-key.provider';
 import type { SessionService } from '../auth/session.service';
 import type { BookingOptions } from './booking.constants';
@@ -104,6 +107,19 @@ function payment(overrides: Record<string, unknown> = {}) {
     paidAt: null,
     ...overrides,
   };
+}
+
+/**
+ * #187 — refus de l'annulation « abandon seulement », tel que `PmsClientService.toRequestError` le
+ * produit du corps réel du PMS (`ApiResponse.Fail` : texte dans `errors`, `message` à `null`).
+ */
+function abandonRefused(
+  text = 'Cannot abandon a reservation whose payment is engaged',
+): PmsRequestError {
+  return new PmsRequestError('Le PMS a renvoyé le statut 409.', 409, {
+    errors: [text],
+    responseBody: { success: false, data: null, message: null, errors: [text] },
+  });
 }
 
 /**
@@ -223,11 +239,21 @@ describe('CheckoutHoldSweeper', () => {
       await sweeper.sweep();
 
       expect(deps.post).toHaveBeenCalledWith(
-        `/roomreservations/${RESERVATION_ID}/cancel`,
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
         undefined,
         expect.objectContaining({ bearerToken: 'jeton' }),
       );
       expect(deps.release).toHaveBeenCalledWith(RESERVATION_ID);
+    });
+
+    it('#187 AC-2 : abandon refusé par le PMS (paiement engagé entre-temps) → hold oublié, sans report', async () => {
+      deps.post.mockRejectedValue(abandonRefused());
+
+      await sweeper.sweep();
+
+      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      expect(deps.release).not.toHaveBeenCalled();
+      expect(deps.reschedule).not.toHaveBeenCalled();
     });
 
     it('relit la réservation avec le JWT du propriétaire (via le `sid` mémorisé)', async () => {
@@ -426,7 +452,7 @@ describe('CheckoutHoldSweeper', () => {
         await sweeper.sweep();
 
         expect(deps.post).toHaveBeenCalledWith(
-          `/roomreservations/${RESERVATION_ID}/cancel`,
+          `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
           undefined,
           expect.objectContaining({ bearerToken: 'jeton' }),
         );
@@ -493,7 +519,7 @@ describe('CheckoutHoldSweeper', () => {
       await sweeper.sweep();
 
       expect(deps.post).toHaveBeenCalledWith(
-        `/roomreservations/${RESERVATION_ID}/cancel`,
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
         undefined,
         expect.anything(),
       );
@@ -571,7 +597,7 @@ describe('CheckoutHoldSweeper', () => {
       await sweeper.sweep();
 
       expect(deps.post).toHaveBeenCalledWith(
-        `/roomreservations/${RESERVATION_ID}/cancel`,
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
         undefined,
         expect.anything(),
       );
@@ -635,6 +661,71 @@ describe('CheckoutHoldSweeper', () => {
       expect(deps.post).not.toHaveBeenCalled();
       expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
       expect(deps.release).not.toHaveBeenCalled();
+    });
+
+    /**
+     * #187 — course lecture/annulation : le voyageur termine son 3DS entre la lecture du paiement par
+     * le balayeur et sa demande d'annulation. Le PMS relit l'intent sous le verrou de ligne et refuse
+     * l'abandon (409) : le hold est traité comme un paiement engagé, sans nouvelle tentative.
+     */
+    it('#187 AC-1 : l’annulation demandée est « abandon seulement »', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, { payment: payment({ intentStatus: 'requires_action' }) });
+
+      await sweeper.sweep();
+
+      const [path] = deps.post.mock.calls[0] as unknown as [string];
+      expect(path).toBe(
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
+      );
+    });
+
+    it('#187 AC-2 : abandon refusé (paiement engagé depuis la lecture) → hold oublié, aucune nouvelle tentative', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, { payment: payment({ intentStatus: 'requires_action' }) });
+      deps.post.mockRejectedValue(abandonRefused());
+
+      await sweeper.sweep();
+
+      expect(deps.post).toHaveBeenCalledTimes(1);
+      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      // Ni libération (la réservation vit), ni report, ni attente : le hold sort de l'index.
+      expect(deps.release).not.toHaveBeenCalled();
+      expect(deps.reschedule).not.toHaveBeenCalled();
+      expect(deps.defer).not.toHaveBeenCalled();
+    });
+
+    it('#187 AC-2 : la passe suivante ne redemande pas l’annulation d’un hold oublié', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, { payment: payment({ intentStatus: 'requires_action' }) });
+      deps.post.mockRejectedValue(abandonRefused());
+      // L'index ne rend le hold que tant qu'il n'a pas été oublié : un report (au lieu de l'oubli)
+      // le laisserait dû, et la passe suivante redemanderait l'annulation.
+      deps.dueHolds.mockImplementation(() =>
+        Promise.resolve(
+          deps.forget.mock.calls.length === 0 ? [RESERVATION_ID] : [],
+        ),
+      );
+
+      await sweeper.sweep();
+      await sweeper.sweep();
+
+      expect(deps.forget).toHaveBeenCalledWith(RESERVATION_ID);
+      expect(deps.post).toHaveBeenCalledTimes(1);
+    });
+
+    it('#187 : un autre 409 du PMS n’est pas un paiement engagé → report compté', async () => {
+      deps.read.mockResolvedValue(issuedHold(WINDOW_MS + 1_000));
+      routePms(deps, { payment: payment({ intentStatus: 'requires_action' }) });
+      deps.post.mockRejectedValue(abandonRefused('Some other conflict'));
+
+      await sweeper.sweep();
+
+      expect(deps.forget).not.toHaveBeenCalled();
+      expect(deps.reschedule).toHaveBeenCalledWith(
+        RESERVATION_ID,
+        expect.any(Number),
+      );
     });
 
     it('AC-4 : annulation refusée par le PMS (libération Stripe en échec) → report, hold conservé', async () => {
@@ -743,7 +834,7 @@ describe('CheckoutHoldSweeper', () => {
         expect.any(Number),
       );
       expect(deps.post).toHaveBeenCalledWith(
-        `/roomreservations/${OTHER_RESERVATION_ID}/cancel`,
+        `/roomreservations/${OTHER_RESERVATION_ID}/cancel?abandonOnly=true`,
         undefined,
         expect.anything(),
       );
@@ -805,7 +896,7 @@ describe('CheckoutHoldSweeper', () => {
         expect.objectContaining({ bearerToken: 'jeton' }),
       );
       expect(deps.post).toHaveBeenCalledWith(
-        `/roomreservations/${RESERVATION_ID}/cancel`,
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
         undefined,
         expect.anything(),
       );
@@ -819,6 +910,22 @@ describe('CheckoutHoldSweeper', () => {
         'booking:idem:v1:abc',
         RESERVATION_ID,
       );
+    });
+
+    it('#187 AC-2 : abandon refusé (paiement engagé) → intention retirée, idempotence conservée, sans report', async () => {
+      deps.post.mockRejectedValue(abandonRefused());
+
+      await sweeper.sweep();
+
+      expect(deps.post).toHaveBeenCalledWith(
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
+        undefined,
+        expect.anything(),
+      );
+      expect(deps.dropIntent).toHaveBeenCalledWith(INTENT_ID);
+      // La réservation vit (paiement engagé) : sa mémoire d'idempotence doit rester.
+      expect(deps.clearIdempotentKey).not.toHaveBeenCalled();
+      expect(deps.rescheduleIntent).not.toHaveBeenCalled();
     });
 
     it('retire l’intention SANS rien annuler quand le PMS n’a jamais écrit', async () => {
@@ -971,7 +1078,7 @@ describe('CheckoutHoldSweeper', () => {
 
       expect(deps.post).toHaveBeenCalledTimes(1);
       expect(deps.post).toHaveBeenCalledWith(
-        `/roomreservations/${RESERVATION_ID}/cancel`,
+        `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
         undefined,
         expect.anything(),
       );
