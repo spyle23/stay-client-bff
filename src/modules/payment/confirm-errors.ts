@@ -58,7 +58,8 @@ export function confirmIdempotencyKey(reservationId: string): string {
 
 /**
  * Motif machine transmis au front dans `errors.reason`. Chaque valeur commande une **issue
- * différente** à l'écran ; « Réessayer » n'est proposé que pour `capture-failed` (et les pannes).
+ * différente** à l'écran ; « Réessayer » n'est proposé que pour `capture-failed`,
+ * `payment-verification-pending` (#183) et les pannes.
  */
 export type ConfirmFailureReason =
   | 'payment-not-authorized'
@@ -70,7 +71,8 @@ export type ConfirmFailureReason =
   | 'room-unavailable'
   | 'not-owner'
   | 'session-invalid'
-  | 'rejected';
+  | 'rejected'
+  | 'payment-verification-pending';
 
 /** Clé du dictionnaire d'erreurs portant le motif machine (identique à `booking` et `payment`). */
 export const CONFIRM_REASON_KEY = 'reason';
@@ -146,6 +148,8 @@ const REASON_MESSAGES: Record<ConfirmFailureReason, string> = {
   'session-invalid': 'Session expirée. Identifiez-vous à nouveau.',
   rejected:
     "La confirmation n'a pas été acceptée. Aucun débit n'a été conservé.",
+  'payment-verification-pending':
+    'Le paiement de cette réservation est en cours de vérification. Réessayez dans un instant.',
 };
 
 /** 4xx d'indisponibilité temporaire (proxy, limiteur) : même traitement qu'une panne. */
@@ -253,6 +257,10 @@ export function toConfirmException(
       return new UnauthorizedException(body);
     case 'rejected':
       return new BadRequestException(body);
+    // #183 AC-2 : hold expiré et paiement illisible pour l'instant (PMS, Stripe, intent en cours).
+    // Rien n'est établi, ni débit ni absence de débit : rejouable, jamais « non autorisé ».
+    case 'payment-verification-pending':
+      return new ServiceUnavailableException(body);
   }
 }
 

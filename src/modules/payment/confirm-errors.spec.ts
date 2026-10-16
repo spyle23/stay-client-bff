@@ -193,6 +193,8 @@ describe('toConfirmException', () => {
     ['not-owner', NotFoundException],
     ['session-invalid', UnauthorizedException],
     ['rejected', BadRequestException],
+    // #183 AC-2 : paiement non vérifiable pour l'instant, rejouable (jamais « non autorisé »).
+    ['payment-verification-pending', ServiceUnavailableException],
   ])('%s → %p', (reason, expected) => {
     const exception = toConfirmException(reason);
     const body = exception.getResponse() as {
@@ -204,6 +206,17 @@ describe('toConfirmException', () => {
     expect(body.errors[CONFIRM_REASON_KEY]).toEqual([reason]);
     // Message BFF générique, jamais le texte du PMS.
     expect(body.message).not.toMatch(/Reservation|Payment|Authorized/);
+  });
+});
+
+describe('toConfirmException — vérification en cours (#183, AC-2)', () => {
+  it('message honnête : ni « aucun paiement autorisé », ni « aucun débit »', () => {
+    const body = toConfirmException(
+      'payment-verification-pending',
+    ).getResponse() as { message: string };
+
+    expect(body.message).toMatch(/vérification/i);
+    expect(body.message).not.toMatch(/n'est pas autorisé|aucun débit/i);
   });
 });
 
