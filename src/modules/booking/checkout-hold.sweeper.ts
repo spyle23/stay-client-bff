@@ -14,6 +14,7 @@ import { SessionService } from '../auth/session.service';
 import type { components } from '../../types/generated/pms';
 import { PMS_CONFIRMATION_ENDPOINTS } from '../payment/confirm-errors';
 import {
+  isAbandonPaymentEngaged,
   isPmsGuid,
   PMS_RESERVATION_ENDPOINTS,
   PMS_STATUS_PENDING,
@@ -119,6 +120,15 @@ const MY_RESERVATIONS_PAGE_SIZE = 100;
  * - aucun intent émis ni paiement (appel d'intent en échec) : annulation à la fin de la fenêtre,
  *   comptée depuis la pose du gel, bien au-delà de tout appel encore en vol.
  * Les attentes ne comptent pas de tentative (`CheckoutHoldService.defer`) : ce ne sont pas des échecs.
+ *
+ * ## Annulation « abandon seulement » (#187)
+ *
+ * La lecture du paiement et l'annulation ne sont pas atomiques : un voyageur peut terminer son 3DS
+ * entre les deux. Toute annulation du balayeur passe donc par `?abandonOnly=true` : le PMS relit
+ * chaque intent chez Stripe **sous le verrou de ligne** et refuse (409) si un paiement est engagé ou
+ * si la réservation n'est plus `Pending`. Ce refus est traité comme un paiement engagé : le hold (ou
+ * l'intention) sort de l'index, sans nouvelle tentative ; la confirmation et la réconciliation ont
+ * la main.
  *
  * ## Deux types d'entrées dans un même index
  *
@@ -336,7 +346,10 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      await this.cancelReservation(fresh.sid, reservationId, passId);
+      if (!(await this.cancelReservation(fresh.sid, reservationId, passId))) {
+        await this.forgetEngaged(reservationId, passId);
+        return;
+      }
       await this.holds.release(reservationId);
       this.logger.log(
         `[passe ${passId}] Réservation ${reservationId} libérée (hold expiré, aucun paiement engagé).`,
@@ -455,6 +468,8 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
    * Annule la `Pending` une fois la fenêtre de paiement écoulée, sinon attend son échéance.
    * L'annulation passe par le JWT du propriétaire ; le PMS libère le paiement chez Stripe AVANT la
    * transition, et refuse (502) si Stripe échoue : `processOne` reporte alors la tentative (AC-4).
+   * Annulation « abandon seulement » (#187) : un paiement engagé depuis la lecture fait refuser
+   * l'abandon (409), et le hold sort alors de l'index sans nouvelle tentative.
    */
   private async cancelAfterWindow(
     record: CheckoutHoldRecord,
@@ -468,7 +483,10 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
       await this.wait(id, deadline);
       return;
     }
-    await this.cancelReservation(record.sid, id, passId);
+    if (!(await this.cancelReservation(record.sid, id, passId))) {
+      await this.forgetEngaged(id, passId);
+      return;
+    }
     await this.holds.release(id);
     this.logger.log(
       `[passe ${passId}] Réservation ${id} libérée : fenêtre de paiement écoulée (${cause}).`,
@@ -561,7 +579,16 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      await this.cancelReservation(record.sid, orphan, passId);
+      if (!(await this.cancelReservation(record.sid, orphan, passId))) {
+        // #187 : la réservation vit (paiement engagé) — sa mémoire d'idempotence reste, et la
+        // confirmation ou la réconciliation en ont la main.
+        this.logger.warn(
+          `[passe ${passId}] Intention ${intentId} : réservation ${orphan} au paiement engagé, ` +
+            'abandon refusé par le PMS — intention retirée sans annulation.',
+        );
+        await this.holds.dropIntent(intentId);
+        return;
+      }
       // La clé d'idempotence est purgée en compare-and-delete : si le voyageur a entre-temps
       // recréé une réservation vivante pour le même séjour, sa mémoire ne doit pas sauter.
       await this.holds.clearIdempotentKey(record.stayKey, orphan);
@@ -727,18 +754,46 @@ export class CheckoutHoldSweeper implements OnModuleInit, OnModuleDestroy {
     return res.data ?? null;
   }
 
+  /**
+   * Annulation **« abandon seulement »** (#187), sous le JWT du propriétaire. `true` : annulée ;
+   * `false` : le PMS a refusé l'abandon (409, paiement engagé ou réservation plus `Pending` depuis
+   * la lecture du balayeur). Toute autre erreur remonte et reporte l'entrée (tentative comptée).
+   */
   private async cancelReservation(
     sid: string,
     reservationId: string,
     passId: string,
+  ): Promise<boolean> {
+    try {
+      await this.sessions.withCustomerAuth(sid, (token) =>
+        this.pms.post(
+          PMS_RESERVATION_ENDPOINTS.abandon(reservationId),
+          undefined,
+          this.context(token, passId),
+        ),
+      );
+      return true;
+    } catch (err) {
+      if (isAbandonPaymentEngaged(err)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Abandon refusé par le PMS (#187, AC-2) : traité comme `PAYMENT_ENGAGED`. Le hold sort de l'index
+   * sans annulation ni nouvelle tentative ; la confirmation et la réconciliation ont la main.
+   */
+  private async forgetEngaged(
+    reservationId: string,
+    passId: string,
   ): Promise<void> {
-    await this.sessions.withCustomerAuth(sid, (token) =>
-      this.pms.post(
-        PMS_RESERVATION_ENDPOINTS.cancel(reservationId),
-        undefined,
-        this.context(token, passId),
-      ),
+    this.logger.log(
+      `[passe ${passId}] Réservation ${reservationId} : paiement engagé depuis la lecture, abandon ` +
+        'refusé par le PMS — hold retiré de l’index sans annulation.',
     );
+    await this.holds.forget(reservationId);
   }
 
   /**

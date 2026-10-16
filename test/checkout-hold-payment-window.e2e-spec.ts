@@ -55,6 +55,8 @@ interface SeenCall {
  * - formulaire abandonné au-delà de la fenêtre : annulation sous le JWT du voyageur, paiement lu
  *   sous `X-Service-Key` seule, hold libéré (AC-2) ;
  * - argent engagé ou doute : jamais d'annulation (AC-3), attente sans tentative ;
+ * - annulation « abandon seulement » refusée (409, paiement engagé depuis la lecture) : hold oublié,
+ *   sans nouvelle tentative (#187, AC-2) ;
  * - le gel d'un intent émis survit à un refus ultérieur (constat de la livraison de #3) ;
  * - confirmation sur une chambre prise : 409 `room-unavailable` et statut de débit (AC-7, AC-8).
  *
@@ -190,10 +192,14 @@ describe('booking/payment window (e2e — Redis réel + PMS mocké)', () => {
       });
   }
 
-  /** Annulation PMS (JWT du voyageur) : la réservation passe `Cancelled` (status 5). */
+  /**
+   * Annulation PMS « abandon seulement » (#187, JWT du voyageur) : la réservation passe `Cancelled`
+   * (status 5). Le paramètre `abandonOnly=true` est exigé : sans lui, nock ne répond pas.
+   */
   function mockCancel(): nock.Scope {
     return nock(PMS_HOST)
       .post(cancelPath())
+      .query({ abandonOnly: 'true' })
       .reply(function () {
         record('POST', cancelPath(), this.req.headers);
         pmsStatus = 5;
@@ -394,6 +400,50 @@ describe('booking/payment window (e2e — Redis réel + PMS mocké)', () => {
       expect(cancel.isDone()).toBe(false);
       expect(await indexScore()).toBeNull();
       expect(await readHold()).not.toBeNull();
+    });
+
+    /**
+     * #187 — le voyageur termine son 3DS entre la lecture du balayeur et l'annulation : le PMS relit
+     * l'intent sous le verrou de ligne et refuse l'abandon (409). Le hold est traité comme engagé.
+     */
+    it('abandon refusé par le PMS (409, paiement engagé depuis la lecture) : hold oublié, sans nouvelle tentative', async () => {
+      intentStatus = 'requires_action';
+      await emitIntent();
+      await patchHold({ intentIssuedAt: Date.now() - 10 * 3_600_000 });
+      const refused = nock(PMS_HOST)
+        .persist()
+        .post(cancelPath())
+        .query({ abandonOnly: 'true' })
+        .reply(function () {
+          record('POST', cancelPath(), this.req.headers);
+          return [
+            409,
+            {
+              success: false,
+              data: null,
+              message: null,
+              errors: ['Cannot abandon a reservation whose payment is engaged'],
+            },
+          ];
+        });
+      await makeDue();
+
+      await sweeper.sweep();
+
+      expect(refused.isDone()).toBe(true);
+      // Refus métier : un seul appel (aucun retry de la frontière), sous le JWT du voyageur.
+      const cancels = calls('POST', cancelPath());
+      expect(cancels).toHaveLength(1);
+      expect(cancels[0].authorization).toBe('Bearer access-1');
+      // Hold retiré de l'index sans libération (la réservation vit) ni tentative comptée.
+      expect(await indexScore()).toBeNull();
+      const hold = await readHold();
+      expect(hold).not.toBeNull();
+      expect(hold?.attempts).toBe(0);
+
+      // La passe suivante ne redemande rien.
+      await sweeper.sweep();
+      expect(calls('POST', cancelPath())).toHaveLength(1);
     });
 
     it('Stripe illisible : doute, report sans tentative (Lua réel)', async () => {

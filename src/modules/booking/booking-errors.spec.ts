@@ -11,6 +11,7 @@ import {
 import {
   BOOKING_REASON_KEY,
   classifyReservationFailure,
+  isAbandonPaymentEngaged,
   isPmsGuid,
   PMS_RESERVATION_ENDPOINTS,
   toBookingException,
@@ -204,6 +205,13 @@ describe('PMS_RESERVATION_ENDPOINTS', () => {
     );
   });
 
+  it('#187 : compose l’annulation « abandon seulement » du balayeur', () => {
+    expect(PMS_RESERVATION_ENDPOINTS.abandon(RESERVATION_ID)).toBe(
+      `/roomreservations/${RESERVATION_ID}/cancel?abandonOnly=true`,
+    );
+    expect(() => PMS_RESERVATION_ENDPOINTS.abandon('r1')).toThrow(/GUID/);
+  });
+
   it('compose la liste des réservations du compte courant (Status + PageSize)', () => {
     expect(PMS_RESERVATION_ENDPOINTS.myReservations(1, 100)).toBe(
       '/roomreservations/my-reservations?Status=1&PageSize=100',
@@ -237,5 +245,63 @@ describe('PMS_RESERVATION_ENDPOINTS', () => {
     expect(isPmsGuid(`${RESERVATION_ID} `)).toBe(false);
     expect(isPmsGuid(undefined)).toBe(false);
     expect(isPmsGuid(42)).toBe(false);
+  });
+});
+
+/**
+ * #187 (AC-2) — refus de l'annulation « abandon seulement » : le PMS a relu l'intent sous le verrou
+ * de ligne et l'a trouvé engagé (ou la réservation confirmée) depuis la lecture du balayeur.
+ */
+describe('isAbandonPaymentEngaged', () => {
+  const ENGAGED = 'Cannot abandon a reservation whose payment is engaged';
+
+  function pmsError(status: number, text: string): PmsRequestError {
+    return new PmsRequestError(
+      `Le PMS a renvoyé le statut ${status}.`,
+      status,
+      {
+        errors: [text],
+        responseBody: {
+          success: false,
+          data: null,
+          message: null,
+          errors: [text],
+        },
+      },
+    );
+  }
+
+  it('reconnaît le 409 du PMS à son texte exact', () => {
+    expect(isAbandonPaymentEngaged(pmsError(409, ENGAGED))).toBe(true);
+  });
+
+  it('reconnaît le texte sous la forme dictionnaire d’`errors`', () => {
+    const err = new PmsRequestError('Le PMS a renvoyé le statut 409.', 409, {
+      errors: { reservation: [ENGAGED] },
+    });
+    expect(isAbandonPaymentEngaged(err)).toBe(true);
+  });
+
+  it.each<[string, unknown]>([
+    [
+      'un autre 409',
+      pmsError(409, 'Room is no longer available for this reservation'),
+    ],
+    ['le même texte sous un autre statut', pmsError(400, ENGAGED)],
+    [
+      'une réservation déjà annulée (400)',
+      pmsError(400, 'Reservation is already cancelled'),
+    ],
+    [
+      'la libération Stripe en échec (502)',
+      new PmsUnavailableError('502', undefined, {
+        status: 502,
+        body: { success: false, errors: [ENGAGED] },
+      }),
+    ],
+    ['une erreur quelconque', new Error(ENGAGED)],
+    ['une valeur non-erreur', ENGAGED],
+  ])('ne confond pas %s avec un paiement engagé', (_label, err) => {
+    expect(isAbandonPaymentEngaged(err)).toBe(false);
   });
 });

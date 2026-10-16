@@ -5686,7 +5686,7 @@
           "RoomReservations"
         ],
         "summary": "Cancel a reservation (Customer can only cancel their own pending/confirmed reservations).",
-        "description": "#4 (story 3.3): the Stripe payment is released BEFORE the transition — a live intent is cancelled,\r\nmoney collected on a Pending reservation is refunded in full. When Stripe cannot do it, nothing is\r\ncancelled and the answer is a 502 (`The payment of this reservation could not be released`),\r\nsafe to replay. A Confirmed reservation whose payment is captured is refused with a 400.",
+        "description": "#4 (story 3.3): the Stripe payment is released BEFORE the transition — a live intent is cancelled,\r\nmoney collected on a Pending reservation is refunded in full. When Stripe cannot do it, nothing is\r\ncancelled and the answer is a 502 (`The payment of this reservation could not be released`),\r\nsafe to replay. A Confirmed reservation whose payment is captured is refused with a 400.\r\n\r\n\r\n#187: `abandonOnly=true` is the cancellation of the client application's hold sweeper, which\r\nread the payment as abandoned. Under the row lock, the reservation must still be Pending and every\r\nStripe intent, re-read at Stripe, still abandoned (`requires_payment_method`,\r\n`requires_confirmation`, `requires_action`, `canceled`); otherwise (3DS completed since\r\nthe read: `requires_capture`, or `processing`, `succeeded`, or a reservation confirmed\r\nmeanwhile) nothing is written and the answer is a 409\r\n(`Cannot abandon a reservation whose payment is engaged`). Without the parameter, the guest\r\ncancellation is unchanged.\r\n",
         "parameters": [
           {
             "name": "id",
@@ -5696,6 +5696,15 @@
             "schema": {
               "type": "string",
               "format": "uuid"
+            }
+          },
+          {
+            "name": "abandonOnly",
+            "in": "query",
+            "description": "Cancel only an abandoned payment (the client application's sweeper, #187).",
+            "schema": {
+              "type": "boolean",
+              "default": false
             }
           }
         ],
@@ -5742,6 +5751,16 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
             "content": {
               "application/json": {
                 "schema": {

@@ -5362,10 +5362,23 @@ export interface paths {
          *     money collected on a Pending reservation is refunded in full. When Stripe cannot do it, nothing is
          *     cancelled and the answer is a 502 (`The payment of this reservation could not be released`),
          *     safe to replay. A Confirmed reservation whose payment is captured is refused with a 400.
+         *
+         *
+         *     #187: `abandonOnly=true` is the cancellation of the client application's hold sweeper, which
+         *     read the payment as abandoned. Under the row lock, the reservation must still be Pending and every
+         *     Stripe intent, re-read at Stripe, still abandoned (`requires_payment_method`,
+         *     `requires_confirmation`, `requires_action`, `canceled`); otherwise (3DS completed since
+         *     the read: `requires_capture`, or `processing`, `succeeded`, or a reservation confirmed
+         *     meanwhile) nothing is written and the answer is a 409
+         *     (`Cannot abandon a reservation whose payment is engaged`). Without the parameter, the guest
+         *     cancellation is unchanged.
          */
         post: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description Cancel only an abandoned payment (the client application's sweeper, #187). */
+                    abandonOnly?: boolean;
+                };
                 header?: never;
                 path: {
                     /** @description The reservation identifier. */
@@ -5413,6 +5426,15 @@ export interface paths {
                 };
                 /** @description Not Found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiResponse"];
+                    };
+                };
+                /** @description Conflict */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };

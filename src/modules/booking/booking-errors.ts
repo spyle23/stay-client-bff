@@ -67,6 +67,14 @@ export const PMS_RESERVATION_ENDPOINTS = {
   cancel: (reservationId: string) =>
     `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/cancel`,
   /**
+   * Annulation **« abandon seulement »** du balayeur de holds (#187) : même route, JWT du voyageur,
+   * mais le PMS relit chaque intent chez Stripe sous le verrou de ligne et refuse (409,
+   * `PMS_ABANDON_PAYMENT_ENGAGED`) dès qu'un paiement est engagé ou que la réservation n'est plus
+   * `Pending`. Le balayeur n'annule ainsi jamais un paiement engagé après sa propre lecture.
+   */
+  abandon: (reservationId: string) =>
+    `/roomreservations/${assertPmsGuid(reservationId, 'reservationId')}/cancel?abandonOnly=true`,
+  /**
    * Remplace le panier de services d'une Réservation `Pending` (story 2.6 / dépendance D6).
    * Sémantique REPLACE : les lignes envoyées deviennent le panier complet.
    */
@@ -217,6 +225,25 @@ export function classifyReservationFailure(
   // Motif inconnu : refus **déterministe** non qualifié. Ne jamais deviner — une chambre
   // annoncée « indisponible » à tort enverrait le voyageur chercher une alternative inexistante.
   return 'rejected';
+}
+
+/**
+ * Texte exact du refus de l'annulation « abandon seulement » (`ReservationErrors.AbandonPaymentEngaged`
+ * de Stay-api, #187), renvoyé en 409 dans `errors`.
+ */
+export const PMS_ABANDON_PAYMENT_ENGAGED =
+  'Cannot abandon a reservation whose payment is engaged';
+
+/**
+ * `true` si l'erreur est le refus d'abandon du PMS (#187, AC-2) : un 409 portant **exactement** ce
+ * texte. Tout autre 409, ou le même texte sous un autre statut, n'est pas un paiement engagé : le
+ * confondre ferait oublier un hold dont la chambre resterait gelée.
+ */
+export function isAbandonPaymentEngaged(err: unknown): boolean {
+  if (!(err instanceof PmsRequestError) || err.status !== 409) {
+    return false;
+  }
+  return flattenPmsErrors(err.errors).includes(PMS_ABANDON_PAYMENT_ENGAGED);
 }
 
 /**
